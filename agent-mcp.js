@@ -715,7 +715,7 @@ function logicTools() {
     async describe_capabilities() {
       return {
         ok: true,
-        app: 'ADB Wi-Fi Коннектор (MultiTool)',
+        app: 'ADB Wi-Fi Коннектор',
         transport: 'HTTP POST /mcp (JSON-RPC 2.0), GET /mcp — схема',
         areas: {
           ui: 'get_ui_tree, click_element, set_text, select_option, select_tab, scroll, take_screenshot, run_js',

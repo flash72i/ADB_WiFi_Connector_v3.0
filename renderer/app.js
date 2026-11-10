@@ -6267,7 +6267,7 @@ function selectCrash(i, scroll) {
 }
 function crashReportText() {
   const { pkg, serial, items } = crashCtx;
-  const head = 'MultiTool — сбои приложения\nУстройство: ' + serial + '\nПакет: ' + pkg + '\nЗаписей: ' + items.length + '\n';
+  const head = 'ADB Wi-Fi Коннектор — сбои приложения\nУстройство: ' + serial + '\nПакет: ' + pkg + '\nЗаписей: ' + items.length + '\n';
   return head + items.map((it, i) => `\n===== ${i + 1}. ${it.time || ''} · ${it.type || ''} · PID ${it.pid || ''} =====\n${it.title || ''}\n${it.text || ''}`).join('\n');
 }
 $('#btn-crash-refresh').onclick = () => loadCrashLog();
@@ -6336,7 +6336,7 @@ function renderAppAudit(r) {
 }
 function auditReportText() {
   const r = auditCtx.data; if (!r) return '';
-  const lines = ['MultiTool — аудит приложения', 'Устройство: ' + auditCtx.serial, 'Пакет: ' + auditCtx.pkg,
+  const lines = ['ADB Wi-Fi Коннектор — аудит приложения', 'Устройство: ' + auditCtx.serial, 'Пакет: ' + auditCtx.pkg,
     'targetSdk: ' + (r.info.targetSdk || '—'), 'Установщик: ' + (r.info.installer || '—'), 'Версия: ' + (r.info.versionName || '—'), '', 'Предупреждения:'];
   for (const w of r.warnings || []) lines.push('• ' + w);
   lines.push('', 'Разрешения:');
