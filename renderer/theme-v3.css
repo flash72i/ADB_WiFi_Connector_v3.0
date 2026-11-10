@@ -1,0 +1,593 @@
+/* ============================================================================
+   theme-v3.css — современное оформление ADB Wi-Fi Коннектор ()
+   Подключается ПОСЛЕ styles.css: только наслаивает внешний вид, не меняет логику.
+   ========================================================================== */
+
+:root {
+  --radius: 16px;
+  --radius-sm: 12px;
+  --radius-lg: 22px;
+  --ease: cubic-bezier(.22, .61, .36, 1);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --dur: .22s;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, .18);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, .22);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, .32);
+}
+
+body[data-theme="dark"] {
+  --bg: #0b1014;
+  --surface: rgba(23, 31, 38, .86);
+  --surface-solid: #171f26;
+  --surface-2: rgba(33, 44, 53, .9);
+  --surface-3: rgba(44, 58, 70, .95);
+  --outline: rgba(120, 148, 166, .22);
+  --outline-strong: rgba(120, 148, 166, .38);
+  --accent: #58c8f8;
+  --accent-2: #2f8fe8;
+  --accent-soft: rgba(88, 200, 248, .14);
+  --text: #eaf2f7;
+  --text-2: #a2b4c0;
+  --shadow: 0 8px 26px rgba(0, 0, 0, .38);
+  --glass: rgba(20, 28, 35, .72);
+}
+
+body[data-theme="light"] {
+  --bg: #eef3f8;
+  --surface: rgba(255, 255, 255, .88);
+  --surface-solid: #ffffff;
+  --surface-2: rgba(238, 244, 249, .95);
+  --surface-3: rgba(224, 234, 242, .95);
+  --outline: rgba(70, 100, 125, .18);
+  --outline-strong: rgba(70, 100, 125, .32);
+  --accent: #1a8fe0;
+  --accent-2: #0f6fc0;
+  --accent-soft: rgba(26, 143, 224, .12);
+  --text: #14232d;
+  --text-2: #58707f;
+  --shadow: 0 8px 24px rgba(30, 70, 100, .12);
+  --glass: rgba(255, 255, 255, .72);
+}
+
+/* ---------- фон приложения: мягкие градиентные пятна ---------- */
+body {
+  background:
+    radial-gradient(900px 520px at 8% -10%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 62%),
+    radial-gradient(760px 480px at 104% 8%, color-mix(in srgb, var(--accent-2) 14%, transparent), transparent 60%),
+    radial-gradient(680px 620px at 50% 118%, rgba(126, 87, 194, .12), transparent 62%),
+    var(--bg);
+  background-attachment: fixed;
+  transition: background-color .3s var(--ease), color .3s var(--ease);
+}
+
+/* ---------- титульная панель ---------- */
+#titlebar {
+  height: 44px;
+  background: var(--glass);
+  backdrop-filter: blur(16px) saturate(1.25);
+  border-bottom: 1px solid var(--outline);
+  position: relative;
+}
+#titlebar::after {
+  content: "";
+  position: absolute; left: 0; right: 0; bottom: -1px; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), color-mix(in srgb, var(--accent-2) 70%, transparent), transparent);
+  opacity: .55;
+  animation: tbGlow 7s var(--ease) infinite alternate;
+}
+@keyframes tbGlow {
+  from { opacity: .25; transform: translateX(-6%); }
+  to   { opacity: .8;  transform: translateX(6%); }
+}
+.tb-icon { transition: transform var(--dur) var(--ease); }
+.tb-icon:hover { transform: rotate(-6deg) scale(1.08); }
+.tb-btn { transition: background var(--dur) var(--ease), color var(--dur) var(--ease); }
+.tb-close:hover { background: var(--danger); color: #fff; }
+#tb-device {
+  max-width: 320px;
+  background: var(--surface-2);
+  border: 1px solid var(--outline);
+  border-radius: 999px;
+  padding: 5px 12px;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+#tb-device:hover { border-color: var(--outline-strong); }
+#tb-device:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* ---------- боковое меню ---------- */
+#rail {
+  width: 186px;
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(1.2);
+  border-right: 1px solid var(--outline);
+  padding: 14px 10px;
+  gap: 6px;
+}
+.rail-item {
+  position: relative;
+  padding: 11px 15px;
+  border-radius: 999px;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease), transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+  overflow: hidden;
+}
+.rail-item::before {
+  content: "";
+  position: absolute; left: 0; top: 50%;
+  width: 3px; height: 0;
+  border-radius: 0 4px 4px 0;
+  background: var(--accent-grad);
+  transform: translateY(-50%);
+  transition: height var(--dur) var(--ease);
+}
+.rail-item:hover {
+  background: var(--surface-2);
+  transform: translateX(3px);
+}
+.rail-item.active {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 26%, transparent), color-mix(in srgb, var(--accent-2) 18%, transparent));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 34%, transparent), 0 6px 18px color-mix(in srgb, var(--accent) 18%, transparent);
+  font-weight: 650;
+}
+.rail-item.active::before { height: 22px; }
+.rail-ico {
+  font-size: 17px;
+  transition: transform var(--dur) var(--ease-out);
+  display: inline-block;
+}
+.rail-item:hover .rail-ico { transform: scale(1.14); }
+.rail-item.active .rail-ico { transform: scale(1.12); }
+.rail-status {
+  padding: 8px 12px;
+  border-top: 1px solid var(--outline);
+  margin-top: 8px;
+}
+
+/* ---------- контент и переходы страниц ---------- */
+#content { padding: 22px 26px 48px; scroll-behavior: smooth; }
+.page.active { animation: pageIn .3s var(--ease-out) both; }
+@keyframes pageIn {
+  from { opacity: 0; transform: translateY(10px) scale(.995); }
+  to   { opacity: 1; transform: none; }
+}
+.page-head h1 {
+  font-size: 23px;
+  letter-spacing: -.2px;
+}
+.page-head h1::after {
+  content: "";
+  display: block;
+  width: 46px; height: 3px;
+  margin-top: 7px;
+  border-radius: 3px;
+  background: var(--accent-grad);
+}
+.section-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-2);
+}
+
+/* ---------- карточки ---------- */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--outline);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.card:hover {
+  border-color: var(--outline-strong);
+  box-shadow: var(--shadow-md);
+}
+.card h3 { margin: 0 0 10px; font-size: 15px; letter-spacing: -.1px; }
+
+/* карточка активного устройства — акцентная */
+.active-device {
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent) 16%, var(--surface-solid)), color-mix(in srgb, var(--accent-2) 10%, var(--surface-solid)));
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--outline));
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--accent) 16%, transparent);
+  animation: cardIn .34s var(--ease-out) both;
+}
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.ad-name { font-size: 16px; font-weight: 650; }
+.dot {
+  display: inline-block;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--ok);
+  margin-right: 8px;
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent);
+  animation: dotPulse 2.2s var(--ease) infinite;
+}
+@keyframes dotPulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 48%, transparent); }
+  70%  { box-shadow: 0 0 0 9px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+/* ---------- кнопки ---------- */
+.btn {
+  position: relative;
+  overflow: hidden;
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background var(--dur) var(--ease), filter var(--dur) var(--ease);
+}
+.btn:active:not(:disabled) { transform: scale(.965); }
+.btn-filled {
+  background: var(--accent-grad);
+  color: #fff;
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.btn-filled:hover:not(:disabled) {
+  filter: brightness(1.08);
+  box-shadow: 0 10px 26px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+.btn-filled::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(110deg, transparent 20%, rgba(255,255,255,.32) 45%, transparent 70%);
+  transform: translateX(-120%);
+  transition: transform .7s var(--ease);
+}
+.btn-filled:hover::after { transform: translateX(120%); }
+.btn-tonal {
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--outline);
+}
+.btn-tonal:hover:not(:disabled) { background: color-mix(in srgb, var(--surface-3) 70%, var(--accent)); }
+
+/* ---------- поля ввода ---------- */
+input[type="text"], input[type="search"], select {
+  background: var(--surface-2);
+  border: 1px solid var(--outline);
+  border-radius: var(--radius-sm);
+  padding: 10px 13px;
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+input[type="text"]:hover, input[type="search"]:hover, select:hover { border-color: var(--outline-strong); }
+input[type="text"]:focus, input[type="search"]:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  background: var(--surface-solid);
+}
+
+/* ---------- чипы ---------- */
+.chip {
+  border-radius: 999px;
+  transition: transform var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.chip:hover { transform: translateY(-1px); }
+.chip.view-chip { background: var(--accent-grad); color: #fff; box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 30%, transparent); }
+.count-chip {
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--outline);
+  padding: 4px 11px;
+}
+
+/* ---------- строки списков ---------- */
+.list-row {
+  border-radius: var(--radius-sm);
+  transition: background var(--dur) var(--ease), transform var(--dur) var(--ease);
+}
+.list-row:hover {
+  background: var(--surface-2);
+  transform: translateX(2px);
+}
+.list-row .avatar {
+  transition: transform var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease);
+}
+.list-row:hover .avatar { transform: scale(1.06); }
+
+/* ---------- статусы ---------- */
+.st-chip { border-radius: 999px; transition: background var(--dur) var(--ease); }
+.st-active {
+  background: color-mix(in srgb, var(--ok) 22%, transparent);
+  color: var(--ok);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ok) 38%, transparent);
+}
+.st-online {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--accent);
+}
+.st-off { background: var(--surface-2); color: var(--text-2); }
+
+/* ---------- прогресс ---------- */
+.progress {
+  height: 7px;
+  border-radius: 99px;
+  background: var(--surface-2);
+  overflow: hidden;
+  position: relative;
+}
+.progress-bar {
+  height: 100%;
+  border-radius: 99px;
+  background: var(--accent-grad);
+  transition: width .35s var(--ease-out);
+  position: relative;
+  overflow: hidden;
+}
+.progress-bar::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.45), transparent);
+  transform: translateX(-100%);
+  animation: shimmer 1.6s linear infinite;
+}
+@keyframes shimmer { to { transform: translateX(100%); } }
+
+/* ---------- диалоги ---------- */
+.overlay { background: rgba(4, 9, 13, .55); backdrop-filter: blur(4px); animation: fadeIn .18s var(--ease) both; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+.dialog {
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--outline-strong);
+  box-shadow: var(--shadow-lg);
+  animation: dialogIn .26s var(--ease-out) both;
+}
+@keyframes dialogIn {
+  from { opacity: 0; transform: translateY(16px) scale(.97); }
+  to   { opacity: 1; transform: none; }
+}
+.dialog-head h2 { letter-spacing: -.2px; }
+
+/* ---------- переключатели ---------- */
+.switch .slider { transition: background var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+.switch input:checked + .slider { box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* ---------- скроллбар ---------- */
+#content::-webkit-scrollbar, .list::-webkit-scrollbar, pre::-webkit-scrollbar { width: 10px; height: 10px; }
+#content::-webkit-scrollbar-track, .list::-webkit-scrollbar-track, pre::-webkit-scrollbar-track { background: transparent; }
+#content::-webkit-scrollbar-thumb, .list::-webkit-scrollbar-thumb, pre::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-2) 32%, transparent);
+  border-radius: 99px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  transition: background var(--dur) var(--ease);
+}
+#content::-webkit-scrollbar-thumb:hover, .list::-webkit-scrollbar-thumb:hover, pre::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+  background-clip: padding-box;
+}
+
+/* ---------- устройства: аккуратная сетка ---------- */
+#device-list.cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
+.dev-card {
+  border-radius: var(--radius);
+  border: 1px solid var(--outline);
+  background: var(--surface);
+  transition: transform var(--dur) var(--ease), box-shadow var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.dev-card:hover {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--outline));
+  box-shadow: var(--shadow-md);
+}
+.dev-card.is-active {
+  border-color: color-mix(in srgb, var(--ok) 42%, var(--outline));
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--ok) 16%, transparent);
+}
+
+/* ---------- иконки приложений/процессов ---------- */
+.apkq-ico, .proc-ico-wrap img, .fs-ico {
+  transition: transform var(--dur) var(--ease-out), filter var(--dur) var(--ease);
+}
+.list-row:hover .apkq-ico, .list-row:hover .fs-ico { transform: scale(1.08); }
+
+/* ---------- вкладки внутри страниц ---------- */
+.tab {
+  border-radius: 999px;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.tab:hover { background: var(--surface-2); }
+.tab.active {
+  background: var(--accent-grad);
+  color: #fff;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+/* ---------- фокус с клавиатуры ---------- */
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 80%, transparent);
+  outline-offset: 2px;
+}
+
+/* ---------- аккуратный hover на карточках способов подключения ---------- */
+.connect-ways > .card { animation: cardIn .3s var(--ease-out) both; }
+.connect-ways > .card:nth-child(2) { animation-delay: .04s; }
+
+/* ---------- уважение к системным настройкам анимации ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* индикатор «не в сети» не пульсирует */
+.dot.off { animation: none; box-shadow: none; background: var(--text-2); }
+
+
+/* согласование высоты титульной панели (44px) с каркасом и кнопками */
+#layout { height: calc(100% - 44px); }
+.tb-btn { height: 44px; }
+
+
+/* ============================================================================
+   «Файлы» — непрозрачные залипающие панели.
+   Причина просвечивания: --surface теперь полупрозрачный (стекло), а панели
+   файлов красятся именно им. Плюс шапка имела margin-top:-18px при padding
+   контента 22px — оставалась щель, через которую виднелись файлы.
+   ========================================================================== */
+#page-files .page-head-sticky {
+  background: var(--surface-solid);
+  margin-top: -22px;
+  padding-top: 22px;
+  box-shadow: 0 10px 0 -6px var(--surface-solid), 0 1px 0 var(--outline);
+}
+.fs-sticky {
+  background: var(--surface-solid);
+}
+/* список не должен «выезжать» за пределы своей области */
+#page-files .card { background: var(--surface-solid); }
+#fs-list { position: relative; z-index: 0; }
+
+/* значок типа подключения (Wi-Fi / USB) — карточки, «Мои устройства», шапка */
+.conn-ico {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 7px; flex: 0 0 auto;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.conn-ico.usb {
+  color: #4fd1a5;
+  background: color-mix(in srgb, #4fd1a5 16%, transparent);
+}
+.conn-ico svg { display: block; }
+#tb-conn-ico { margin-right: 6px; }
+#tb-conn-ico:empty { display: none; }
+.dev-name .conn-ico { margin-right: 6px; }
+
+/* контекстное меню приложения (правый клик по строке) */
+.app-ctx { min-width: 250px; }
+.app-ctx-title {
+  padding: 7px 12px 9px; margin-bottom: 4px;
+  font-weight: 600; font-size: 12.5px; color: var(--text-2);
+  border-bottom: 1px solid var(--outline);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ============================================================================
+   «Файлы» — жёсткая граница. Причина: sticky-шапка парковалась на 66px
+   (22px padding контента), тулбар на 121px, а топбар был полупрозрачным —
+   строки списка просвечивали в щелях и через топбар.
+   ========================================================================== */
+#titlebar {
+  background: var(--surface-solid) !important;
+  backdrop-filter: none !important;
+  z-index: 200;
+}
+/* анимация без transform: transform превращал .page в containing block и ломал sticky */
+.page.active { animation: pageInOpacity .25s var(--ease-out); }
+@keyframes pageInOpacity { from { opacity: 0; } to { opacity: 1; } }
+#page-files .page-head-sticky {
+  top: -22px;               /* парковка ровно под топбаром: 44px */
+  background: var(--surface-solid);
+}
+#page-files .fs-sticky {
+  top: 34px;                /* вплотную под шапкой: 44 + 56 - 22 */
+  background: var(--surface-solid);
+}
+
+/* подсветка файла после «Открыть расположение» */
+.fs-flash { animation: fsFlash 2.6s var(--ease-out); }
+@keyframes fsFlash {
+  0%, 100% { background: transparent; }
+  15%, 70% { background: color-mix(in srgb, var(--accent) 22%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 55%, transparent); }
+}
+/* компактный блок ошибки установки APK в очереди */
+.apkq-row { flex-wrap: wrap; }
+.apkq-err {
+  flex-basis: 100%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, #ff5a5a 9%, transparent);
+  border: 1px solid color-mix(in srgb, #ff5a5a 26%, transparent);
+  max-width: 560px;
+}
+.apkq-err-line { font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.apkq-err-act { display: flex; gap: 4px; margin-top: 4px; }
+.apkq-log { margin: 8px 0 0; padding: 8px; border-radius: 8px; background: rgba(0, 0, 0, .28); font: 11px/1.5 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 140px; overflow: auto; }
+.btn-xs { padding: 2px 8px; font-size: 11px; }
+
+/* компактный блок ошибки установки в мини-окне */
+.mini-err { margin-top: 8px; padding: 8px 10px; border-radius: 10px; background: color-mix(in srgb, #ff5a5a 10%, transparent); border: 1px solid color-mix(in srgb, #ff5a5a 28%, transparent); }
+.mini-err-line { font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+.mini-err-act { display: flex; gap: 4px; margin-top: 4px; }
+.mini-err-log { margin: 8px 0 0; padding: 8px; border-radius: 8px; background: rgba(0, 0, 0, .3); font: 11px/1.45 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 120px; overflow: auto; }
+
+/* автор внизу левой панели */
+.rail-author { font-size: 10.5px; line-height: 1.3; color: var(--text-2); text-align: center; padding: 2px 0 8px; opacity: .85; }
+
+
+/* эффекты в духе ReactBits — мягкий spotlight на карточках и блик на заголовке */
+.card::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(220px circle at var(--mx, 50%) var(--my, 0%), color-mix(in srgb, var(--accent) 8%, transparent), transparent 68%);
+  opacity: 0;
+  transition: opacity .25s ease;
+}
+.card:hover::after { opacity: 1; }
+.tb-title {
+  background: linear-gradient(100deg, var(--text) 25%, color-mix(in srgb, var(--accent) 65%, #fff) 50%, var(--text) 75%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: tbShine 9s linear infinite;
+}
+@keyframes tbShine {
+  0% { background-position: 120% 0; }
+  100% { background-position: -120% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card::after { display: none; }
+  .tb-title { animation: none; background: none; color: var(--text); -webkit-text-fill-color: currentColor; }
+}
+.card { position: relative; }
+
+/* компактная панель управления устройством — кнопки-иконки с тултипами */
+.ctl-chips { gap: 6px; }
+.ctl-chip {
+  width: 34px; height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 16px; line-height: 1;
+}
+
+/* скроллбар шире и заметнее */
+::-webkit-scrollbar { width: 15px; height: 13px; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 7px; border: 3px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--text-2); }
+
+/* отступы в панели файлов — фильтр не прилипает к категориям */
+#fs-filter { margin-left: 8px; }
+.fs-sticky .row + .row { margin-top: 9px; }
+#fs-quick { margin-top: 9px; }
+#fs-list { margin-top: 10px; }
+
+/* крестик очистки внутри текстовых полей */
+.ic-wrap { position: relative; display: inline-flex; align-items: center; }
+.ic-wrap input { padding-right: 30px !important; }
+.ic-clear {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; border-radius: 50%; border: 0; margin: 0; padding: 0;
+  background: transparent; color: var(--text-2); font-size: 12px; line-height: 1;
+  cursor: pointer; display: none; align-items: center; justify-content: center;
+}
+.ic-clear:hover { color: var(--text); background: var(--surface-2); }
+.ic-clear.show { display: inline-flex; }
+
+/* иконка подключения в шапке — прижата к селектору устройства, а не «плавает» по центру */
+#tb-conn-ico { margin-left: auto; margin-right: 2px; }
+#tb-conn-ico.conn-ico { flex: 0 0 auto; }
+#tb-device { margin: 0 14px 0 6px; }
+
+/* салют по клику на автора — полноэкранный фейерверк поверх окна */
+#salute-layer {
+  position: fixed; inset: 0; z-index: 9999; pointer-events: none;
+  background: transparent;
+}
+#salute-layer.hidden { display: none; }
+#salute-canvas { width: 100vw; height: 100vh; display: block; }

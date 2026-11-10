@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Плеер</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="theme-v3.css">
+<link rel="stylesheet" href="player.css">
+</head>
+<body class="player-window" data-theme="dark">
+<div class="player-root">
+  <div class="dialog media-dlg" id="media-shell" tabindex="-1">
+    <div class="dialog-head">
+      <h2 id="media-title" style="font-size:15px;word-break:break-all" data-tip="Название файла">Плеер</h2>
+      <button class="dlg-x" id="btn-media-min" data-tip="Свернуть окно плеера" style="margin-left:auto">&#8211;</button>
+      <button class="dlg-x" id="btn-media-fs" data-tip="Во весь экран">&#9974;</button>
+      <button class="dlg-x" id="btn-media-close" data-tip="Закрыть плеер">&#x2715;</button>
+    </div>
+    <div class="media-stage" id="media-stage">
+      <video id="media-el" class="hidden" playsinline data-tip="Клик — пауза / продолжить"></video>
+      <video id="media-el2" class="hidden" playsinline data-tip="Клик — пауза / продолжить"></video>
+      <div id="media-visual" class="media-visual">
+        <canvas id="media-vis" width="960" height="320" data-tip="Визуализация: реагирует на звук"></canvas>
+      </div>
+      <div class="media-ytbar" id="media-ytbar">
+        <button class="ytbtn" id="media-prev" data-tip="Предыдущий файл (←)">&#9198;</button>
+        <button class="ytbtn ytplay" id="media-play" data-tip="Плей / пауза (пробел)">&#9654;</button>
+        <button class="ytbtn" id="media-next" data-tip="Следующий файл (→)">&#9197;</button>
+        <input type="range" id="media-seek" min="0" max="1000" value="0" class="grow" data-tip="Позиция (колесо мыши — перемотка)">
+        <span class="mono small yttime" id="media-time" data-tip="Прошло / общая длительность">0:00 / 0:00</span>
+        <button class="ytbtn" id="yt-volbtn" data-tip="Громкость: клик — выкл/вкл звук">&#128266;</button>
+        <input type="range" id="media-vol" min="0" max="100" value="5" style="width:64px" data-tip="Громкость (колесо мыши)">
+        <span class="mono small ytvol" id="yt-vol-lbl">5%</span>
+        <button class="ytbtn" id="media-fit" data-tip="Как заполнять экран: вписать / заполнить / растянуть">&#9634;</button>
+        <button class="ytbtn" id="yt-full" data-tip="Во весь экран (на монитор)">&#9974;</button>
+        <button class="ytbtn" id="yt-window" data-tip="Вернуться в окно">&#x2921;</button>
+        <button class="ytbtn" id="yt-close" data-tip="Закрыть плеер">&#x2715;</button>
+      </div>
+    </div>
+    <div class="media-vis-switch" id="media-vis-switch">
+      <span id="media-vis-name" class="hidden">1. Столбики</span>
+      <button class="btn btn-tonal btn-sm" id="media-vis-prev" data-tip="Предыдущая визуализация">&#8249;</button>
+      <button class="btn btn-tonal btn-sm" id="media-vis-next" data-tip="Следующая визуализация">&#8250;</button>
+    </div>
+    <div class="media-now">
+      <div class="media-name" id="media-now-name" data-tip="Текущий файл">—</div>
+      <div class="muted small" id="media-now-sub" data-tip="Формат и источник воспроизведения"></div>
+    </div>
+    <div class="media-controls">
+      <button class="btn btn-tonal btn-sm" id="media-eqbtn" data-tip="Эквалайзер: звук через аудио-движок, визуализация в такт">EQ</button>
+      <button class="btn btn-tonal btn-sm" id="media-dl" data-tip="Скачать файл на компьютер">&#8681; Скачать</button>
+      <button class="btn btn-tonal btn-sm" id="media-openpc" data-tip="Скачать и открыть системным плеером — проиграет ЛЮБОЙ формат">&#9654; На ПК</button>
+      <button class="btn btn-tonal btn-sm" id="media-full" data-tip="Во весь экран внутри окна плеера">Во весь экран</button>
+    </div>
+    <div id="media-eq" class="hidden">
+      <div class="eq-row" id="eq-bands"></div>
+      <div class="row" style="margin-top:8px">
+        <span class="muted small">Пресеты:</span>
+        <span class="chips" id="eq-presets"></span>
+      </div>
+    </div>
+    <div class="muted small" id="media-status" style="margin-top:6px" data-tip="Полный путь к файлу на телефоне"></div>
+    <div id="player-snack" class="hidden"></div>
+    <div id="player-tip" class="hidden"></div>
+  </div>
+</div>
+<script src="vislib.js"></script>
+<script src="player.js"></script>
+</body>
+</html>

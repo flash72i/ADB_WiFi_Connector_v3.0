@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Tray</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: transparent; overflow: hidden; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; user-select: none; }
+  .menu {
+    margin: 10px;
+    background: rgba(18, 24, 30, .92);
+    backdrop-filter: blur(16px) saturate(1.2);
+    border: 1px solid rgba(255,255,255,.10);
+    border-radius: 12px;
+    box-shadow: 0 14px 34px rgba(0,0,0,.5);
+    padding: 6px;
+    color: #e8edf2;
+  }
+  .mi {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 9px 12px; border: 0; background: transparent; border-radius: 8px;
+    color: #e8edf2; font-size: 13px; cursor: pointer; text-align: left;
+  }
+  .mi:hover { background: rgba(99,102,241,.16); }
+  .mi .ic { width: 18px; text-align: center; color: #a5b4fc; font-size: 14px; }
+  .sep { height: 1px; background: rgba(255,255,255,.09); margin: 5px 8px; }
+  .mi.danger { color: #f28b82; }
+  .mi.danger:hover { background: rgba(242,139,130,.14); }
+</style>
+</head>
+<body>
+<div class="menu">
+  <button class="mi" id="m-show"><span class="ic">&#9632;</span>Показать окно</button>
+  <div class="sep"></div>
+  <button class="mi" id="m-scan"><span class="ic">&#8635;</span>Сканировать сеть</button>
+  <button class="mi" id="m-sett"><span class="ic">&#9881;</span>Настройки</button>
+  <div class="sep"></div>
+  <button class="mi danger" id="m-exit"><span class="ic">&#10005;</span>Выход</button>
+</div>
+<script>
+  const a = window.api;
+  const act = (id, msg) => document.getElementById(id).addEventListener('click', () => a.trayMenu(msg));
+  act('m-show', 'show');
+  act('m-scan', 'scan');
+  act('m-sett', 'sett');
+  act('m-exit', 'exit');
+</script>
+</body>
+</html>

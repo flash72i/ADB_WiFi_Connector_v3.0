@@ -1,0 +1,27 @@
+# Runtime data and logs
+app.log
+*.log
+Сохранения/
+
+# Node.js
+node_modules/
+
+# Build artifacts
+release/
+APP/
+installer/bin/*
+!installer/bin/icon.ico
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.bak
+
+# Secrets / local configs
+.env
+.env.*
+mcp*.json
+*.local.json

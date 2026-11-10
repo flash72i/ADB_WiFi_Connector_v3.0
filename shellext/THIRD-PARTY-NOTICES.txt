@@ -1,0 +1,51 @@
+Компоненты расширения «Иконки приложений в Проводнике»
+=========================================================
+
+ApkShellext2 (apkshellext)
+  Лицензия: MIT
+  Copyright (c) 2015 Jingang Guo, KK
+  https://github.com/kkguo/apkshellext
+  Полный текст: LICENSE-APKSHELLEXT.txt
+
+SharpShell
+  Лицензия: MIT
+  Copyright (c) Dave Kerr
+  https://github.com/dwmkerr/sharpshell
+
+SharpZipLib
+  Лицензия: MIT
+  https://github.com/icsharpcode/SharpZipLib
+
+Google.Protobuf
+  Лицензия: BSD-3-Clause
+  Copyright 2008 Google Inc.
+  https://github.com/protocolbuffers/protobuf
+
+libwebp
+  Лицензия: BSD-3-Clause
+  Copyright (c) 2010, Google Inc.
+  https://chromium.googlesource.com/webm/libwebp
+  Полный текст: LICENSE-LIBWEBP.txt
+
+SVG.NET (vvvv/SVG)
+  Лицензия: MS-PL
+  https://github.com/vvvv/SVG
+
+QRCoder
+  Лицензия: MIT
+  https://github.com/codebude/QRCoder
+
+Ionic.Zlib (DotNetZip)
+  Лицензия: MS-PL
+  https://github.com/kkguo/Ionic.Zlib
+
+PlistCS
+  Лицензия: MIT
+  https://github.com/kkguo/PlistCS
+
+PNGDecrush
+  Лицензия: MIT
+  https://github.com/kkguo/PNGDecrush
+
+Сборка libwebp 1.5.0 для этого приложения выполнена из исходников
+с статической CRT; распространяется по BSD-3-Clause.
