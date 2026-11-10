@@ -260,7 +260,7 @@ input[type="text"]:focus, input[type="search"]:focus, select:focus {
   border-radius: 999px;
   transition: transform var(--dur) var(--ease), background var(--dur) var(--ease), color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
-.chip:hover { transform: translateY(-1px); }
+.chip:hover { transform: none; }
 .chip.view-chip { background: var(--accent-grad); color: #fff; box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 30%, transparent); }
 .count-chip {
   border-radius: 999px;
@@ -276,7 +276,6 @@ input[type="text"]:focus, input[type="search"]:focus, select:focus {
 }
 .list-row:hover {
   background: var(--surface-2);
-  transform: translateX(2px);
 }
 .list-row .avatar {
   transition: transform var(--dur) var(--ease-out), box-shadow var(--dur) var(--ease);
@@ -530,6 +529,9 @@ input[type="text"]:focus, input[type="search"]:focus, select:focus {
   transition: opacity .25s ease;
 }
 .card:hover::after { opacity: 1; }
+/* файловая карточка: без hover-подсветки, чтобы край не «дышал» */
+#page-files .card:hover { border-color: var(--outline); }
+#page-files .card:hover::after { opacity: 0; }
 .tb-title {
   background: linear-gradient(100deg, var(--text) 25%, color-mix(in srgb, var(--accent) 65%, #fff) 50%, var(--text) 75%);
   background-size: 220% 100%;

@@ -116,6 +116,7 @@ const BASE_DIR = (() => {
   const d = path.dirname(process.execPath);
   return path.basename(d).toUpperCase() === 'APP' ? path.dirname(d) : d;
 })();
+const IS_INSTALLED = (() => { try { return fs.existsSync(path.join(BASE_DIR, '.installed')); } catch (e) { return false; } })();
 
 // (F16): ВСЕ сохранения — строго в папке с программой: <BASE_DIR>/Сохранения
 const SAVE_DIR = path.join(BASE_DIR, 'Сохранения');
@@ -254,7 +255,10 @@ const DEFAULTS = {
 sounds: true,
   showPkgNames: false,  // приложения: показывать имена (false) или пакеты (true) — F11
   agentEnabled: false,  // управление программой через MCP-агента (Настройки)
-  assocOn: false,       // владелец включал ассоциации — при старте тихо восстанавливаем
+  assocOn: IS_INSTALLED,
+  shellextOn: IS_INSTALLED,
+  modeInit: false,
+  portableCleanupDone: false,
   migrated24: false,    // одноразовая миграция: автовключённые ранее автоподключения выключаем
   migrated25: false     // одноразовая миграция сохранений в «Сохранения/» (F16)
 };
@@ -460,6 +464,12 @@ function migrateSaves() {
 function loadAll() {
   ensureDirs();
   config = Object.assign({}, DEFAULTS, loadJson(CFG_FILE, {}));
+  if (!config.modeInit) {
+    config.assocOn = IS_INSTALLED;
+    config.shellextOn = IS_INSTALLED;
+    config.modeInit = true;
+    saveConfig();
+  }
   // R3: владелец требует «не подключаться при запуске, если я не выбрал в настройках».
   // Прежние версии включали автоподключения — одноразово выключаем, точечно (winBounds,
   // adbPath, scrcpyPath, favCmds не трогаем); в настройках можно включить обратно.
@@ -3671,7 +3681,7 @@ const map = {
     }
     return { ok: true, state, note: 'apks.zip / apk.zip — двойные расширения, Windows их не ассоциирует: открывайте через правую кнопку → «Открыть с помощью». Иконки в Проводнике обновятся сразу; если старая программа ещё помнится — снимите её «Открыть по умолчанию» один раз.' };
   });
-  ipcMain.handle('assoc:set', async (_e, on) => {
+  async function assocApply(on) {
     if (!process.platform.startsWith('win')) return { ok: false, error: 'Только Windows' };
     const r = await regBatch(assocRegArgs(!!on, process.execPath));
     if (r.ok) { config.assocOn = !!on; saveConfig(); }
@@ -3712,7 +3722,8 @@ const map = {
         '. Если файл открывается старой программой: правый клик → «Открыть с помощью» → выберите программу и «Всегда».';
     }
     return r;
-  });
+  }
+  ipcMain.handle('assoc:set', (_e, on) => assocApply(on));
 
   /* ================= иконки приложений в Проводнике (apkshellext, HKLM) ================= */
   // Shell-расширение читает настоящую иконку из APK/AAB/XAPK/APKM/APKS/APKV; для OBB — значок Android.
@@ -4171,6 +4182,30 @@ const map = {
   ipcMain.handle('clipboard:write', async (_e, text) => {
     try { clipboard.writeText(String(text == null ? '' : text)); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
   });
+  const INTEGRATION_INSTALL = process.argv.includes('--install-integration');
+  const INTEGRATION_CLEAN = process.argv.includes('--clean-integration');
+  if (INTEGRATION_INSTALL || INTEGRATION_CLEAN) {
+    setTimeout(async () => {
+      try {
+        if (INTEGRATION_INSTALL) {
+          await assocApply(true);
+          await shellextApply('install');
+        } else {
+          await assocApply(false);
+          try {
+            const st = await shellextStatus();
+            if (st && st.installed) await shellextApply('uninstall');
+          } catch (e) {}
+          try { fs.rmSync(shellextDir(), { recursive: true, force: true }); } catch (e) {}
+          config.assocOn = false;
+          config.shellextOn = false;
+          config.portableCleanupDone = true;
+          saveConfig();
+        }
+      } catch (e) { try { logErr('integration', e.message); } catch (e2) {} }
+      app.exit(0);
+    }, 600);
+  }
 }
 
 // ---------- запуск ----------

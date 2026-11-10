@@ -1335,6 +1335,20 @@ namespace AdbWifiSetup
             t.Start();
         }
 
+        void RunIntegration(string target, string arg)
+        {
+            string exe = Path.Combine(target, "APP", EXE_NAME);
+            if (!File.Exists(exe)) return;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(exe, "--hidden " + arg);
+                psi.UseShellExecute = false;
+                psi.WorkingDirectory = target;
+                using (Process p = Process.Start(psi)) { p.WaitForExit(180000); }
+            }
+            catch { }
+        }
+
         void Work()
         {
             string target = portable ? portablePath : installPath;
@@ -1383,13 +1397,17 @@ namespace AdbWifiSetup
                 progressInt = 93; stageInt = 1;
                 if (!portable)
                 {
+                    try { File.WriteAllText(Path.Combine(target, ".installed"), "1"); } catch { }
                     InstallOps.CreateShortcuts(target, cbDesktop, cbMenu);
                     progressInt = 97; stageInt = 2;
                     InstallOps.Register(target, cbAuto);
+                    RunIntegration(target, "--install-integration");
                 }
                 else
                 {
+                    try { File.Delete(Path.Combine(target, ".installed")); } catch { }
                     if (!File.Exists(Path.Combine(target, EXE_NAME))) throw new Exception("Не найден " + EXE_NAME + " после распаковки.");
+                    RunIntegration(target, "--clean-integration");
                 }
 
                 progressInt = 100; stageInt = portable ? 2 : 3;
