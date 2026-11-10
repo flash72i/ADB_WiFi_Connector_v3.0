@@ -109,7 +109,7 @@ body {
 .rm-vol-v input[type="range"] { writing-mode: vertical-lr; direction: rtl; width: 16px; height: 52px; accent-color: var(--accent); }
 .rm-vol-ic { font-size: 10px; color: var(--text-2); line-height: 1; }
 .rm-vol-lbl { font-size: 9.5px; color: var(--text-2); font-family: var(--mono); line-height: 1; }
-#content { flex: 1; overflow-y: auto; padding: 18px 22px 40px; }
+#content { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 18px 22px 40px; }
 .page { display: none; }
 .page.active { display: block; }
 .page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }

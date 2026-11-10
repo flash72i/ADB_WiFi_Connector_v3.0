@@ -179,7 +179,6 @@ body {
 }
 .card:hover {
   border-color: var(--outline-strong);
-  box-shadow: var(--shadow-md);
 }
 .card h3 { margin: 0 0 10px; font-size: 15px; letter-spacing: -.1px; }
 
