@@ -580,10 +580,25 @@ input[type="text"]:focus, input[type="search"]:focus, select:focus {
 .ic-clear:hover { color: var(--text); background: var(--surface-2); }
 .ic-clear.show { display: inline-flex; }
 
+/* анимация загрузки папки: три бегущие точки */
+.fs-loading { display: inline-flex; align-items: center; gap: 7px; }
+.fs-loading-dots { display: inline-flex; align-items: center; gap: 3px; margin-left: 2px; }
+.fs-loading-dots span {
+  width: 5px; height: 5px; border-radius: 50%; background: currentColor;
+  opacity: .25; animation: fsDot 1s infinite ease-in-out;
+}
+.fs-loading-dots span:nth-child(2) { animation-delay: .15s; }
+.fs-loading-dots span:nth-child(3) { animation-delay: .3s; }
+@keyframes fsDot {
+  0%, 80%, 100% { opacity: .25; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-3px); }
+}
+
 /* иконка подключения в шапке — прижата к селектору устройства, а не «плавает» по центру */
-#tb-conn-ico { margin-left: auto; margin-right: 2px; }
+#tb-conn-ico { margin: 0 4px 0 0; }
+#tb-conn-ico:empty { display: none; }
 #tb-conn-ico.conn-ico { flex: 0 0 auto; }
-#tb-device { margin: 0 14px 0 6px; }
+#tb-device { flex: 0 1 320px; width: min(320px, 42vw); margin: 0 8px; }
 
 /* салют по клику на автора — полноэкранный фейерверк поверх окна */
 #salute-layer {
@@ -592,3 +607,136 @@ input[type="text"]:focus, input[type="search"]:focus, select:focus {
 }
 #salute-layer.hidden { display: none; }
 #salute-canvas { width: 100vw; height: 100vh; display: block; }
+/* Softer light theme and contrast fixes for components that use dark-specific colors. */
+body[data-theme="light"] {
+  --bg: #e7edf2;
+  --surface: rgba(249, 251, 252, .92);
+  --surface-solid: #f7fafc;
+  --surface-2: rgba(234, 241, 246, .96);
+  --surface-3: rgba(220, 231, 239, .96);
+  --outline: rgba(65, 92, 112, .22);
+  --text: #1b2b35;
+  --text-2: #526a78;
+  --accent: #167fc4;
+  --accent-2: #0e68a8;
+  --accent-soft: rgba(22, 127, 196, .12);
+  --glass: rgba(247, 250, 252, .8);
+}
+body[data-theme="light"] .mic-card,
+body[data-theme="light"] .sysmic-card,
+body[data-theme="light"] .driver-card { background: var(--surface); }
+body[data-theme="light"] .mic-wave-box {
+  background:
+    radial-gradient(ellipse at 50% 115%, rgba(22, 127, 196, .14), transparent 60%),
+    linear-gradient(180deg, #f4f8fb, #e7eff5);
+  border-color: var(--outline);
+}
+body[data-theme="light"] .mic-wave-idle { color: var(--text-2); }
+body[data-theme="light"] .mic-action {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: var(--outline);
+}
+body[data-theme="light"] .mic-action.primary { color: #fff; }
+body[data-theme="light"] .mic-check {
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-color: var(--outline);
+}
+body[data-theme="light"] .mic-device select,
+body[data-theme="light"] .sysmic-select {
+  background: var(--surface-solid);
+  color: var(--text);
+  border-color: var(--outline);
+}
+body[data-theme="light"] .seg-control { background: var(--surface-2); border-color: var(--outline); }
+body[data-theme="light"] .seg-item { color: var(--text-2); }
+body[data-theme="light"] .seg-item:hover { color: var(--accent); background: var(--accent-soft); }
+body[data-theme="light"] .camera-stage {
+  background: #e6eff5;
+  border-color: #b9ccd8;
+}
+body[data-theme="light"] .camera-placeholder { background: #e3ebf1; color: var(--text-2); }
+body[data-theme="light"] .camera-badge { background: rgba(247, 250, 252, .86); color: var(--text); border-color: var(--outline); }
+body[data-theme="light"] .driver-row { color: var(--text-2); }
+body[data-theme="light"] .btn {
+  background: #d9e6ef;
+  color: #14232d;
+  border: 1px solid #b8cbd8;
+}
+body[data-theme="light"] .btn.primary {
+  background: linear-gradient(135deg, #167fc4, #0e68a8);
+  color: #fff;
+  border-color: transparent;
+}
+body[data-theme="light"] .sysmic-current {
+  background: #dceaf3;
+  border-color: #b6cede;
+}
+body[data-theme="light"] .sysmic-current b { color: #12384f; }
+body[data-theme="light"] .sysmic-badge {
+  background: #e2edf4;
+  color: #3e5b6c;
+  border-color: #b8cbd8;
+}
+body[data-theme="light"] .camera-placeholder { color: #405a6b; }
+body[data-theme="light"] #cam-hint { color: #405a6b; }
+body[data-theme="light"] .muted { color: #526a78; }
+body[data-theme="light"] {
+  --bg: #dde7ee;
+  --surface: rgba(246, 249, 251, .94);
+  --surface-solid: #f4f8fa;
+  --surface-2: #e5eef4;
+  --surface-3: #d4e2eb;
+  --outline: rgba(55, 80, 98, .24);
+  --outline-strong: rgba(55, 80, 98, .38);
+  --text: #172831;
+  --text-2: #405a69;
+}
+body[data-theme="light"] .btn {
+  background: #c9dae5;
+  color: #14232d;
+  border: 1px solid #9fb9c9;
+}
+body[data-theme="light"] .btn:hover:not(:disabled) { background: #bfd2df; }
+body[data-theme="light"] .btn.primary {
+  background: linear-gradient(135deg, #167fc4, #0e68a8);
+  color: #fff;
+  border-color: transparent;
+}
+body[data-theme="light"] .camera-status,
+body[data-theme="light"] .hint,
+body[data-theme="light"] .muted,
+body[data-theme="light"] .muted.small { color: #3d5666; }
+body[data-theme="light"] .mic-wave-idle { color: #3d5666; }
+body[data-theme="light"] .camera-mode-label,
+body[data-theme="light"] .camera-zoom-label,
+body[data-theme="light"] .mic-viz-label { color: #3d5666; }
+body[data-theme="light"] .camera-mode-label select,
+body[data-theme="light"] .mic-device select,
+body[data-theme="light"] .sysmic-select {
+  background: #edf4f8;
+  border-color: #9fb9c9;
+  color: #172831;
+}
+body[data-theme="light"] .camera-card,
+body[data-theme="light"] .mic-card,
+body[data-theme="light"] .sysmic-card,
+body[data-theme="light"] .driver-card { border-color: #b9ccd8; }
+
+#pair-log:empty { display: none; }
+body[data-theme="light"] .console {
+  background: #eef5f9;
+  border: 1px solid #c3d5e1;
+  color: #132a36;
+  box-shadow: inset 0 1px 3px rgba(31, 62, 84, .08);
+}
+body[data-theme="light"] .console::selection,
+body[data-theme="light"] .console *::selection { background: rgba(22, 127, 196, .22); }
+body[data-theme="light"] .phone-frame {
+  background: #e6eff5;
+  border-color: #b9ccd8;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .75), 0 10px 24px rgba(42, 74, 95, .08);
+}
+body[data-theme="light"] .phone-placeholder,
+body[data-theme="light"] .phone-placeholder .muted { color: #3d5666; }

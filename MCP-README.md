@@ -111,7 +111,7 @@ Cursor, OpenCode и т.п.) может найти программу по это
 сначала `pm disable-user --user 0`, а если прошивка отвечает
 `Cannot disable system packages` — `pm uninstall -k --user 0`
 (обратимо: `app_action("restore", pkg)` → `cmd package install-existing --user 0`).
-<br>Проверено на POCO F6 / HyperOS: отключение и восстановление работают.
+<br>Проверено на Android 16 / HyperOS: отключение и восстановление работают.
 
 ## Примеры
 

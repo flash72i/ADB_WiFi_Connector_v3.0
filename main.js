@@ -89,6 +89,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const zlib = require('zlib');   // сборка ZIP-архивов (fs:zipcreate)
+const http = require('http');   // статус локального сервера камеры
 const { execFile, spawn } = require('child_process');
 const adb = require('./adb');
 const crashlog = require('./crashlog');   // разбор падений/ANR по logcat
@@ -96,6 +97,7 @@ const appaudit = require('./appaudit');  // аудит разрешений и A
 const mdns = require('./mdns');
 const agentMcp = require('./agent-mcp');   // встроенный MCP-сервер для ИИ-агента
 const qrpair = require('./qrpair');
+let devDetectFn = null;
 
 // разрешаем автовоспроизведение медиа в плеере БЕЗ жеста пользователя —
 // иначе Chromium блокировал video.play() после асинхронной загрузки файла с телефона
@@ -147,7 +149,7 @@ function unlockLoad() {
   } catch (e) { unlockStore = {}; }
   return unlockStore;
 }
-function unlockSave() { try { fs.writeFileSync(UNLOCK_FILE, JSON.stringify(unlockStore || {}, null, 2)); } catch (e) {} }
+function unlockSave() { saveJson(UNLOCK_FILE, unlockStore || {}); }
 // ключ хранилища — аппаратный серийник (ro.serialno), а не host:port:
 // у Wi-Fi ADB порт меняется между подключениями, а пароль должен остаться «у устройства».
 const unlockKeyCache = new Map();
@@ -242,16 +244,18 @@ function logInfo(tag, ...a) { logLine('INFO ', tag, ...a); }
 // совместимость: прежние информационные log() больше НЕ пишут в файл
 function log() {}
 process.on('uncaughtException', e => { logErr('uncaught', e && (e.stack || e.message) || String(e)); });
+process.on('unhandledRejection', e => { logErr('unhandledRejection', e && (e.stack || e.message) || String(e)); });
 
 const DEFAULTS = {
   adbPath: null,
   scrcpyPath: null,
   autostart: false,
-  closeToTray: true,
+  closeToTray: false,
   theme: 'dark',
   scanOnStart: false,
   autoreconnect: false,
   autolast: false,
+  autoconnect: false,
 sounds: true,
   showPkgNames: false,  // приложения: показывать имена (false) или пакеты (true) — F11
   agentEnabled: false,  // управление программой через MCP-агента (Настройки)
@@ -260,7 +264,8 @@ sounds: true,
   modeInit: false,
   portableCleanupDone: false,
   migrated24: false,    // одноразовая миграция: автовключённые ранее автоподключения выключаем
-  migrated25: false     // одноразовая миграция сохранений в «Сохранения/» (F16)
+  migrated25: false,    // одноразовая миграция сохранений в «Сохранения/» (F16)
+  migratedCloseQuit: false // по умолчанию крестик завершает программу, а не прячет в трей
 };
 
 let config = Object.assign({}, DEFAULTS);
@@ -276,6 +281,8 @@ let miniWin = null;   // отдельное окно установки APK (а�
 let playerWin = null; // отсоединяемый плеер — своё окно, можно двигать по всему экрану
 let playerClosing = false;
 
+const ALLOWED_SETTINGS = new Set(['adbPath', 'scrcpyPath', 'autostart', 'closeToTray', 'theme', 'scanOnStart', 'autoreconnect', 'autolast', 'autoconnect', 'sounds', 'favCmds', 'showPkgNames', 'agentEnabled']);
+
 // трей создаётся лениво — в режиме «только установщик» его нет вовсе
 function ensureTray() {
   try {
@@ -289,10 +296,14 @@ function ensureTray() {
 let logcatChild = null;
 let recordChild = null;
 let recordMeta = null;
+let recordQuitClosing = false;
+let closeScrcpyWindowFn = null;
 let shellChild = null;      // раньше жил в замыкании registerIpc и переживал выход
 let installChild = null;    // текущий «adb install» (для отмены)
 let installCanceled = false;
 let mirrorChild = null, mirrorMode = null, mirrorSerial = null;
+let cameraProc = null;       // Python-сервер камеры телефона (страница «Камера»)
+let audioProc = null;        // Python-сервер микрофона телефона (страница «Микрофон»)
 let mirrorJpegChild = null, mirrorTimer = null, mirrorWatchdog = null;
 let mirrorGen = 0, mirrorRestarts = 0, mirrorLastData = 0, jpegSeq = 0;
 
@@ -437,7 +448,17 @@ function ensureDirs() {
   try { if (fs.existsSync(ICON_CACHE)) fs.rmSync(ICON_CACHE, { recursive: true, force: true }); } catch (e) {}
 }
 function loadJson(f, fb) { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return fb; } }
-function saveJson(f, v) { try { fs.writeFileSync(f, JSON.stringify(v, null, 2)); } catch (e) {} }
+function saveJson(f, v) {
+  let text;
+  try { text = JSON.stringify(v, null, 2); } catch (e) { logErr('saveJson', f, e.message); return; }
+  try {
+    const tmp = f + '.tmp';
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, f);
+  } catch (e) {
+    try { fs.writeFileSync(f, text); } catch (e2) { logErr('saveJson', f, e2.message); }
+  }
+}
 // одноразовая миграция старых сохранений из %APPDATA%/adb-wifi-ru в «Сохранения/» (F16).
 // после копирования config.json ПЕРЕЧИТЫВАЕМ его — иначе настройки
 // старой установки (adbPath, тема, размеры окна) безвозвратно теряются при обновлении
@@ -479,6 +500,11 @@ function loadAll() {
     config.migrated24 = true;
   }
   migrateSaves(); // должен идти ПОСЛЕ чтения config: использует флаг migrated25
+  if (!config.migratedCloseQuit) {
+    config.closeToTray = false;
+    config.migratedCloseQuit = true;
+    saveConfig();
+  }
   history = loadJson(HIST_FILE, []);
   favorites = loadJson(FAV_FILE, []);
   if (config.adbPath) adb.setAdbPath(config.adbPath);
@@ -600,7 +626,18 @@ function createWindow() {
     logErr('render-process-gone', 'stopping children');
     stopMirrorAll();
     try { if (logcatChild) logcatChild.kill('SIGKILL'); } catch (e) {}
-    try { if (recordChild) recordChild.kill('SIGKILL'); } catch (e) {}
+    if (recordChild) {
+      const child = recordChild, meta = recordMeta;
+      if (typeof closeScrcpyWindowFn === 'function') {
+        closeScrcpyWindowFn(child.pid, meta && meta.hwnd).then(ok => {
+          if (!ok && recordChild === child) { try { child.kill('SIGKILL'); } catch (err) {} }
+        }).catch(() => {
+          if (recordChild === child) { try { child.kill('SIGKILL'); } catch (err) {} }
+        });
+      } else {
+        try { child.kill('SIGKILL'); } catch (err) {}
+      }
+    }
     try { if (shellChild) shellChild.kill('SIGKILL'); } catch (e) {}
   });
   win.once('ready-to-show', () => {
@@ -703,7 +740,49 @@ function createWindow() {
   win.on('close', (e) => {
     if (!quitting && config.closeToTray) { e.preventDefault(); win.hide(); }
   });
+  win.on('closed', () => {
+    const shouldQuit = !quitting && !config.closeToTray && !miniOnly;
+    win = null;
+    if (shouldQuit) {
+      try { if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.destroy(); } catch (e) {}
+      app.quit();
+    }
+  });
   return win;
+}
+
+function showMainWindow() {
+  try {
+    if (!win || win.isDestroyed()) {
+      forceShowMain = true;
+      miniOnly = false;
+      createWindow();
+    }
+    if (!win || win.isDestroyed()) return false;
+    if (win.isMinimized()) win.restore();
+    if (!win.isVisible()) win.show();
+    win.focus();
+    try { win.moveTop(); } catch (e) {}
+    mainShown = true;
+    return true;
+  } catch (e) {
+    logErr('showMainWindow', e.message);
+    return false;
+  }
+}
+
+function sendMainTask(ev) {
+  const deliver = () => {
+    try {
+      if (win && !win.isDestroyed()) win.webContents.send('task:event', ev);
+    } catch (e) {}
+  };
+  const wasAlive = !!(win && !win.isDestroyed());
+  showMainWindow();
+  if (wasAlive) deliver();
+  else {
+    try { win.webContents.once('did-finish-load', deliver); } catch (e) {}
+  }
 }
 
 // ---------- трей ----------
@@ -718,10 +797,11 @@ function trayIcon() {
 // (нативное меню Electron не стилизуется — владелец просил «такое же красивое меню»)
 let trayMenuWin = null;
 function trayMenuShow() {
+  if (!tray || tray.isDestroyed()) return;
   try {
     if (trayMenuWin && !trayMenuWin.isDestroyed()) { trayMenuWin.show(); trayMenuWin.focus(); return; }
     trayMenuWin = new BrowserWindow({
-      width: 246, height: 210, show: false, frame: false, resizable: false, alwaysOnTop: true,
+      width: 270, height: 270, show: false, frame: false, resizable: false, alwaysOnTop: true,
       skipTaskbar: true, backgroundColor: '#00000000', transparent: true, hasShadow: false,
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
@@ -732,9 +812,10 @@ function trayMenuShow() {
     trayMenuWin.loadFile(path.join(__dirname, 'renderer', 'traymenu.html'));
     trayMenuWin.once('ready-to-show', () => {
       try {
+        if (!tray || tray.isDestroyed()) return;
         const pos = tray.getBounds();
         const wa = require('electron').screen.getPrimaryDisplay().workArea;
-        const MW = 246, MH = 210;
+        const MW = 270, MH = 270;
         // (как в Telegram): левый край меню — у значка, меню раскрывается ВПРАВО и ВВЕРХ.
         // Раньше прижимали правый край — меню уезжало влево от значка.
         let x = Math.round(pos.x - 8);
@@ -754,7 +835,7 @@ function trayMenuShow() {
 }
 
 function buildTrayMenu() {
-  if (!tray) return;
+  if (!tray || tray.isDestroyed()) return;
   tray.setToolTip('ADB Wi-Fi Коннектор (RU)');
   // КРИТИЧНЫЙ ФИКС «пустого меню». Раньше стоял
   // setContextMenu(Menu.buildFromTemplate([])) — пустое СИСТЕМНОЕ меню перехватывало
@@ -763,8 +844,17 @@ function buildTrayMenu() {
   tray.setContextMenu(null);
   tray.removeAllListeners('click');
   tray.removeAllListeners('right-click');
-  tray.on('click', () => { win.isVisible() ? win.hide() : (win.show(), win.focus()); });
-  tray.on('right-click', () => trayMenuShow());
+  tray.on('click', () => {
+    if (!tray || tray.isDestroyed()) return;
+    try {
+      if (win && !win.isDestroyed() && !win.isMinimized() && win.isVisible()) win.hide();
+      else showMainWindow();
+    } catch (e) { showMainWindow(); }
+  });
+  tray.on('right-click', () => {
+    if (!tray || tray.isDestroyed()) return;
+    trayMenuShow();
+  });
 }
 
 // ---------- вспомогательное ----------
@@ -1060,7 +1150,44 @@ async function phoneWifiIp(serial) {
   return m ? m[1] : null;
 }
 
-async function phoneTransferOne(srcSerial, dstSerial, dstIp, srcPath, destDir, port) {
+async function phoneNetcat(serial) {
+  try {
+    const r = await adb.run(['-s', serial, 'shell', 'command -v nc'], { timeout: 10000 });
+    const p = String(r.stdout || '').trim().split(/\r?\n/).pop();
+    if (p) return { cmd: p };
+    const b = await adb.run(['-s', serial, 'shell', 'command -v busybox'], { timeout: 10000 });
+    const bp = String(b.stdout || '').trim().split(/\r?\n/).pop();
+    if (bp) return { cmd: bp + ' nc', busybox: bp };
+  } catch (e) {}
+  return null;
+}
+async function ensureNetcatOn(serial, helperSerial) {
+  const own = await phoneNetcat(serial);
+  if (own) return own;
+  const helper = await phoneNetcat(helperSerial);
+  if (!helper || !helper.busybox) return null;
+  const local = path.join(os.tmpdir(), 'adbwifi-busybox-' + process.pid + '-' + Date.now() + '.bin');
+  const remoteDir = '/data/local/tmp/adbwifi';
+  const remote = remoteDir + '/busybox';
+  try {
+    const cached = await adb.run(['-s', serial, 'shell', `test -x ${remote} && ${remote} nc --help`], { timeout: 10000 });
+    if (cached.ok) return { cmd: remote + ' nc' };
+    const pull = await adb.run(['-s', helperSerial, 'pull', helper.busybox, local], { timeout: 60000 });
+    if (!pull.ok || !fs.existsSync(local)) return null;
+    const mk = await adb.run(['-s', serial, 'shell', 'mkdir', '-p', remoteDir], { timeout: 10000 });
+    if (!mk.ok) return null;
+    const push = await adb.run(['-s', serial, 'push', local, remote], { timeout: 60000 });
+    if (!push.ok) return null;
+    const chmod = await adb.run(['-s', serial, 'shell', 'chmod', '755', remote], { timeout: 10000 });
+    if (!chmod.ok) return null;
+    const test = await adb.run(['-s', serial, 'shell', remote, 'nc', '--help'], { timeout: 10000 });
+    if (!test.ok) return null;
+    return { cmd: remote + ' nc' };
+  } finally {
+    try { fs.unlinkSync(local); } catch (e) {}
+  }
+}
+async function phoneTransferOne(srcSerial, dstSerial, dstIp, srcPath, destDir, port, srcNc, dstNc, replace) {
   const clean = String(srcPath || '').replace(/\/+$/, '');
   const cut = clean.lastIndexOf('/');
   if (cut <= 0) return { ok: false, path: srcPath, error: 'Не удалось определить папку источника' };
@@ -1068,10 +1195,13 @@ async function phoneTransferOne(srcSerial, dstSerial, dstIp, srcPath, destDir, p
   const base = clean.slice(cut + 1);
   if (!base) return { ok: false, path: srcPath, error: 'Некорректное имя файла' };
   const dest = destDir.replace(/\/+$/, '') || '/';
+  if (replace) {
+    try { await adb.run(['-s', dstSerial, 'shell', 'rm', '-rf', adb.shq(dest + '/' + base)], { timeout: 15000 }); } catch (e) {}
+  }
   const exe = adb.getAdbPath();
   if (!exe) return { ok: false, path: srcPath, error: 'adb не найден' };
 
-  const recvCmd = 'nc -l -p ' + port + ' tar -x -C ' + adb.shq(dest);
+  const recvCmd = dstNc + ' -l -p ' + port + ' | tar -x -C ' + adb.shq(dest);
   const recv = spawn(exe, ['-s', dstSerial, 'shell', recvCmd], { windowsHide: true });
   let recvErr = '';
   recv.stderr.on('data', d => { recvErr += d.toString('utf8'); });
@@ -1084,7 +1214,7 @@ async function phoneTransferOne(srcSerial, dstSerial, dstIp, srcPath, destDir, p
     return { ok: false, path: srcPath, error: 'Порт ' + port + ' занят: ' + recvErr.trim().slice(0, 160) };
   }
 
-  const sendCmd = 'tar -c -C ' + adb.shq(srcDir) + ' ' + adb.shq(base) + ' | nc ' + dstIp + ' ' + port;
+  const sendCmd = 'tar -c -C ' + adb.shq(srcDir) + ' ' + adb.shq(base) + ' | ' + srcNc + ' ' + dstIp + ' ' + port;
   const send = await adb.run(['-s', srcSerial, 'shell', sendCmd], { timeout: 30 * 60 * 1000 });
   const closed = await Promise.race([
     recvClosed,
@@ -1095,27 +1225,60 @@ async function phoneTransferOne(srcSerial, dstSerial, dstIp, srcPath, destDir, p
     try { recv.kill('SIGKILL'); } catch (e) {}
     return { ok: false, path: srcPath, error: (send.stderr || send.error || 'Передача не удалась').trim().slice(0, 300) };
   }
-  if (closed && closed.code !== 0) {
-    return { ok: false, path: srcPath, error: ('Получатель: ' + (recvErr || ('код ' + closed.code))).slice(0, 300) };
-  }
   const check = await adb.run(['-s', dstSerial, 'shell', 'ls -ld ' + adb.shq(dest + '/' + base)], { timeout: 15000 });
   if (!check.ok) return { ok: false, path: srcPath, error: 'Файл не появился у получателя' };
+  if (closed && closed.code !== 0 && !/chown|operation not permitted/i.test(recvErr || '')) {
+    return { ok: false, path: srcPath, error: ('Получатель: ' + (recvErr || ('код ' + closed.code))).slice(0, 300) };
+  }
   return { ok: true, path: srcPath, name: base };
 }
 
-async function phoneTransferMany(srcSerial, dstSerial, paths, destDir) {
+async function uniqueDestName(dstSerial, destDir, base) {
+  const dot = base.lastIndexOf('.');
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  const ext = dot > 0 ? base.slice(dot) : '';
+  const dir = destDir.replace(/\/+$/, '');
+  for (let i = 1; i < 100; i++) {
+    const name = stem + ' (' + i + ')' + ext;
+    const r = await adb.run(['-s', dstSerial, 'shell', 'test', '-e', adb.shq(dir + '/' + name)], { timeout: 10000 });
+    if (!r.ok) return name;
+  }
+  return stem + ' (' + Date.now() + ')' + ext;
+}
+async function phoneTransferMany(srcSerial, dstSerial, paths, destDir, conflict) {
   const dstIp = await phoneWifiIp(dstSerial);
   if (!dstIp) return { ok: false, error: 'У получателя нет Wi-Fi-адреса. Подключите его по Wi-Fi.' };
+  const srcNc = await ensureNetcatOn(srcSerial, dstSerial);
+  const dstNc = await ensureNetcatOn(dstSerial, srcSerial);
+  if (!srcNc) return { ok: false, error: 'На источнике нет nc, а busybox с получателя скопировать не удалось.' };
+  if (!dstNc) return { ok: false, error: 'На получателе нет nc, а busybox с источника скопировать не удалось.' };
   const mk = await adb.run(['-s', dstSerial, 'shell', 'mkdir -p ' + adb.shq(destDir)], { timeout: 15000 });
   if (!mk.ok) return { ok: false, error: 'Не удалось создать папку у получателя: ' + (mk.stderr || '').slice(0, 160) };
   const items = [];
-  for (const p of paths) {
+  for (let i = 0; i < paths.length; i++) {
+    const p = paths[i];
+    let sendPath = p, tmpDir = null, replace = false;
+    if (conflict === 'rename') {
+      const base = p.split('/').pop();
+      const finalName = await uniqueDestName(dstSerial, destDir, base);
+      tmpDir = '/data/local/tmp/adbwifi-send-' + process.pid + '-' + Date.now() + '-' + i;
+      const mkTmp = await adb.run(['-s', srcSerial, 'shell', 'mkdir', '-p', tmpDir], { timeout: 15000 });
+      const cp = mkTmp.ok ? await adb.run(['-s', srcSerial, 'shell', 'cp', '-r', adb.shq(p), adb.shq(tmpDir + '/' + finalName)], { timeout: 300000 }) : mkTmp;
+      if (!cp.ok) {
+        items.push({ ok: false, path: p, error: 'Не удалось подготовить новое имя: ' + (cp.stderr || cp.error || 'ошибка').slice(0, 200) });
+        continue;
+      }
+      sendPath = tmpDir + '/' + finalName;
+    } else if (conflict === 'replace') {
+      replace = true;
+    }
     let last = null;
     for (let attempt = 0; attempt < 4; attempt++) {
       const port = 45000 + Math.floor(Math.random() * 4000);
-      last = await phoneTransferOne(srcSerial, dstSerial, dstIp, p, destDir, port);
+      last = await phoneTransferOne(srcSerial, dstSerial, dstIp, sendPath, destDir, port, srcNc.cmd, dstNc.cmd, replace);
       if (last.ok || !/Порт \d+ занят/.test(last.error || '')) break;
     }
+    if (tmpDir) await adb.run(['-s', srcSerial, 'shell', 'rm', '-rf', adb.shq(tmpDir)], { timeout: 15000 });
     items.push(last);
   }
   return { ok: items.every(x => x && x.ok), src: srcSerial, dst: dstSerial, dstIp, dest: destDir, items };
@@ -1203,19 +1366,19 @@ function registerIpc() {
   }));
 
   // белый список ключей настроек: renderer не должен уметь писать произвольные поля
-  const ALLOWED_SETTINGS = new Set(['adbPath', 'scrcpyPath', 'autostart', 'closeToTray', 'theme', 'scanOnStart', 'autoreconnect', 'autolast', 'sounds', 'favCmds', 'showPkgNames', 'agentEnabled']);
   ipcMain.handle('settings:set', async (_e, key, value) => {
     if (typeof key !== 'string' || !ALLOWED_SETTINGS.has(key)) return { ok: false, error: 'Недопустимый ключ настройки: ' + String(key).slice(0, 50) };
 if (key === 'autostart') return setAutostart(!!value);
     config[key] = value; saveConfig();
     if (key === 'adbPath') adb.setAdbPath(value);
     if (key === 'agentEnabled') agentMcp.setEnabled(!!value);
+    if (win && !win.isDestroyed()) win.webContents.send('setting:changed', { key, value });
     return { ok: true };
   });
 
   // MCP-агент — тумблер, аварийная остановка, состояние, запуск серии
   ipcMain.handle('agent:get-state', async () => ({
-    ok: true, enabled: agentMcp.isEnabled(), logs: agentMcp.getLog().slice(-30)
+    ok: true, enabled: agentMcp.isEnabled(), endpoint: agentMcp.endpoint(), logs: agentMcp.getLog().slice(-30)
   }));
   ipcMain.handle('agent:set-enabled', async (_e, v) => {
     agentMcp.setEnabled(!!v);
@@ -1349,23 +1512,49 @@ if (key === 'autostart') return setAutostart(!!value);
   ipcMain.on('log:renderer', (_e, msg) => logErr('renderer', String(msg).slice(0, 500)));
   // ошибки, показанные пользователю в интерфейсе (snack/статусы) — тоже в журнал (F19)
   ipcMain.on('log:ui', (_e, msg) => logErr('ui', String(msg).slice(0, 500)));
+  // USB-устройства Android, которые Windows видит как MTP/WPD даже без ADB
+  // (например, HONOR 9X с выключенной отладкой). Используется и в «Сканировать сеть»,
+  // и в кнопке включения режима разработчика.
+  async function pnpAndroidUsb() {
+    const script = "Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { ($_.Class -eq 'AndroidUsbDeviceClass') -or ($_.Class -eq 'WPD' -and $_.InstanceId -notmatch '^SWD' -and $_.InstanceId -notmatch 'USBSTOR' -and ($_.InstanceId -match '^USB.VID_(12D1|18D1|04E8|2717|22D9|2D95|0BB4|1004|0FCE|1EBF|2A70|22B8|0E8D|2E04|17EF)' -or $_.FriendlyName -match 'Android|MTP|ADB|Xiaomi|Samsung|Pixel|OnePlus|Huawei|Honor|Oppo|Vivo|Realme')) } | Select-Object Status,Class,FriendlyName,InstanceId | ConvertTo-Json -Compress";
+    const raw = await new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script], { windowsHide: true, timeout: 15000 }, (err, stdout) => resolve(String(stdout || '')));
+    });
+    try {
+      const a = JSON.parse(raw);
+      const list = (Array.isArray(a) ? a : [a]).map(x => ({ status: x.Status, cls: x.Class, name: x.FriendlyName, id: x.InstanceId }));
+      const seen = new Set();
+      return list.filter(x => {
+        const k = String(x.name || '') + '|' + String(x.id || '');
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    } catch (e) { return []; }
+  }
   ipcMain.handle('adb:scan-subnet', async () => {
     sendTask({ kind: 'scan-start' });
     // параллельно: свип 5555, mDNS (свой + adb), повторный опрос известных адресов
     const known = [];
     for (const h of history) known.push({ host: h.host, port: h.port, label: 'из истории' });
     for (const f of favorites) known.push({ host: f.host, port: f.port, label: 'избранное' });
-    const [found, md] = await Promise.all([
+    const [found, md, usb] = await Promise.all([
       adb.scanSubnet((done, total) => {
         if (done % 32 === 0) sendTask({ kind: 'scan-progress', done, total });
       }),
-      mergedDiscover()
+      mergedDiscover(),
+      pnpAndroidUsb()
     ]);
     const out = (found || []).map(x => ({ host: x.host, port: x.port, label: 'порт 5555' }));
     for (const m of (md || []).filter(x => (x.service || '').includes('connect'))) {
       if (!out.some(o => o.host === m.host && o.port === m.port)) {
         out.push({ host: m.host, port: m.port, label: x2(m.src), sid: m.sid, instance: m.instance || null });
       }
+    }
+    // USB-устройства без ADB: показываем отдельными строками, к ним нельзя
+    // подключиться по adb, но можно открыть MTP-файлы через Проводник Windows.
+    for (const u of (usb || [])) {
+      out.push({ usb: true, name: u.name || 'Android USB', id: u.id || '', status: u.status || '', cls: u.cls || '', label: 'USB (MTP/WPD)' });
     }
     // опрос известных адресов (телефон со случайным TLS-портом из истории/избранного)
     const uniqKnown = [];
@@ -1415,6 +1604,130 @@ if (key === 'autostart') return setAutostart(!!value);
     function x2(s) { return s === 'adb-mdns' ? 'adb mDNS' : 'mDNS'; }
   });
   ipcMain.handle('adb:mdns', async () => mergedDiscover());
+  // список USB-устройств Android (MTP/WPD) для чипа в файловом менеджере
+  ipcMain.handle('usb:pnp', async () => pnpAndroidUsb());
+  // открыть MTP-папку USB-устройства в Проводнике: файлы доступны даже без ADB
+  ipcMain.handle('usb:open-mtp', async (_e, name) => {
+    const raw = String(name || '').trim().slice(0, 120);
+    if (!raw) return { ok: false, error: 'Не указано устройство' };
+    const safe = raw.replace(/'/g, "''");
+    const script = "$shell = New-Object -ComObject Shell.Application; $pc = $shell.Namespace(17); $item = $pc.Items() | Where-Object { $_.Name -eq '" + safe + "' } | Select-Object -First 1; if (-not $item) { $item = $pc.Items() | Where-Object { $_.Name -like '*" + safe + "*' } | Select-Object -First 1 }; if ($item) { $item.InvokeVerb('open'); 'OPENED' } else { Start-Process explorer.exe 'shell:MyComputerFolder'; 'THISPC' }";
+    const r = await new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script], { windowsHide: true, timeout: 20000 }, (err, stdout) => resolve({ ok: !err, out: String(stdout || ''), err: String((err && err.message) || '') }));
+    });
+    if (/OPENED/.test(r.out)) return { ok: true, opened: true };
+    if (/THISPC/.test(r.out)) return { ok: true, opened: false, message: 'Устройство не найдено — открыл «Этот компьютер»' };
+    return { ok: false, error: r.err || 'Не удалось открыть MTP-устройство' };
+  });
+  // ===== встроенный MTP-браузер: Android без ADB, через Windows Shell =====
+  // PowerShell получает JSON в base64 (никаких кавычек в именах файлов) и
+  // проходит по папкам MTP-устройства. Возвращает JSON, а не текст.
+  function mtpPowerShell(body, payload, timeout) {
+    const json = JSON.stringify(payload || {});
+    const b64 = Buffer.from(json, 'utf8').toString('base64');
+    const prelude = `[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$ErrorActionPreference = 'Stop'
+$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}')) | ConvertFrom-Json
+$deviceName = [string]$payload.device
+$parts = @($payload.path)
+$shell = New-Object -ComObject Shell.Application
+$pc = $shell.Namespace(17)
+$dev = $pc.Items() | Where-Object { $_.Name -eq $deviceName } | Select-Object -First 1
+if (-not $dev) { [pscustomobject]@{ ok = $false; error = 'DEVICE_NOT_FOUND' } | ConvertTo-Json -Compress; exit 0 }
+$folder = $dev.GetFolder
+foreach ($p in $parts) {
+  $child = $folder.Items() | Where-Object { $_.Name -eq [string]$p } | Select-Object -First 1
+  if (-not $child) { [pscustomobject]@{ ok = $false; error = 'PATH_NOT_FOUND' } | ConvertTo-Json -Compress; exit 0 }
+  $folder = $child.GetFolder
+}
+`;
+    const script = prelude + body;
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    return new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], { windowsHide: true, timeout: timeout || 30000 }, (err, stdout, stderr) => {
+        const text = String(stdout || '').replace(/^\uFEFF/, '').trim();
+        let data = null;
+        try { data = JSON.parse(text.split(/\r?\n/).filter(Boolean).pop() || '{}'); } catch (e) {}
+        if (!data) data = { ok: false, error: String(stderr || (err && err.message) || 'MTP error').slice(0, 300) };
+        if (err && err.killed) data.timeout = true;
+        if (err && data.ok !== true && !data.error) data.error = String(stderr || err.message || 'MTP error').slice(0, 300);
+        resolve(data);
+      });
+    });
+  }
+  function mtpListBody() {
+    return `$items = @($folder.Items() | ForEach-Object { [pscustomobject]@{ name = [string]$_.Name; dir = [bool]$_.IsFolder } })
+[pscustomobject]@{ ok = $true; items = $items } | ConvertTo-Json -Compress -Depth 4`;
+  }
+  function mtpPullBody() {
+    return `$leaf = [string]$payload.leaf
+$item = @($folder.Items() | Where-Object { $_.Name -eq $leaf }) | Select-Object -First 1
+if (-not $item -or $item.IsFolder) { [pscustomobject]@{ ok = $false; error = 'FILE_NOT_FOUND' } | ConvertTo-Json -Compress; exit 0 }
+$dir = Join-Path $env:TEMP ('mtp-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+$dest = $shell.Namespace($dir)
+$dest.CopyHere($item, 16)
+$safe = $item.Name -replace '/', '_'
+$target = Join-Path $dir $safe
+$deadline = (Get-Date).AddSeconds(300)
+while (-not (Test-Path -LiteralPath $target) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+if (-not (Test-Path -LiteralPath $target)) { [pscustomobject]@{ ok = $false; error = 'COPY_TIMEOUT' } | ConvertTo-Json -Compress; exit 0 }
+[pscustomobject]@{ ok = $true; file = $target; name = $item.Name } | ConvertTo-Json -Compress`;
+  }
+  function mtpPushBody() {
+    return `$local = [string]$payload.local
+$leaf = Split-Path -Leaf $local
+if (-not (Test-Path -LiteralPath $local)) { [pscustomobject]@{ ok = $false; error = 'LOCAL_NOT_FOUND' } | ConvertTo-Json -Compress; exit 0 }
+$folder.CopyHere($local, 16)
+$deadline = (Get-Date).AddSeconds(300)
+while (-not (@($folder.Items() | Where-Object { $_.Name -eq $leaf }).Count) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+if (-not (@($folder.Items() | Where-Object { $_.Name -eq $leaf }).Count)) { [pscustomobject]@{ ok = $false; error = 'COPY_TIMEOUT' } | ConvertTo-Json -Compress; exit 0 }
+[pscustomobject]@{ ok = $true; name = $leaf } | ConvertTo-Json -Compress`;
+  }
+  ipcMain.handle('mtp:list', async (_e, device, pathParts) => {
+    return mtpPowerShell(mtpListBody(), { device, path: Array.isArray(pathParts) ? pathParts : [] }, 30000);
+  });
+  ipcMain.handle('mtp:open', async (_e, device, pathParts, leaf) => {
+    const r = await mtpPowerShell(mtpPullBody(), { device, path: Array.isArray(pathParts) ? pathParts : [], leaf }, 320000);
+    if (!r || !r.ok) return r;
+    const op = await shell.openPath(r.file);
+    return op ? { ok: false, error: op, file: r.file } : { ok: true, file: r.file, name: r.name };
+  });
+  ipcMain.handle('mtp:save', async (_e, device, pathParts, leaf) => {
+    const f = await dialog.showSaveDialog(win, { defaultPath: path.join(app.getPath('downloads'), String(leaf || 'file')) });
+    if (f.canceled || !f.filePath) return { ok: false, canceled: true };
+    const r = await mtpPowerShell(mtpPullBody(), { device, path: Array.isArray(pathParts) ? pathParts : [], leaf }, 320000);
+    if (!r || !r.ok) return r;
+    try {
+      fs.copyFileSync(r.file, f.filePath);
+      fs.rmSync(path.dirname(r.file), { recursive: true, force: true });
+      return { ok: true, file: f.filePath };
+    } catch (e) { return { ok: false, error: e.message }; }
+  });
+  ipcMain.handle('mtp:push', async (_e, device, pathParts, localPath) => {
+    let local = '';
+    if (localPath) {
+      if (!fs.existsSync(localPath)) return { ok: false, error: 'LOCAL_NOT_FOUND' };
+      local = localPath;
+    } else {
+      const f = await dialog.showOpenDialog(win, { properties: ['openFile'] });
+      if (f.canceled || !f.filePaths || !f.filePaths[0]) return { ok: false, canceled: true };
+      local = f.filePaths[0];
+    }
+    return mtpPowerShell(mtpPushBody(), { device, path: Array.isArray(pathParts) ? pathParts : [], local }, 320000);
+  });
+  ipcMain.handle('mtp:delete', async (_e, device, pathParts, leaf) => {
+    const body = `$leaf = [string]$payload.leaf
+$item = @($folder.Items() | Where-Object { $_.Name -eq $leaf }) | Select-Object -First 1
+if (-not $item -or $item.IsFolder) { [pscustomobject]@{ ok = $false; error = 'FILE_NOT_FOUND' } | ConvertTo-Json -Compress; exit 0 }
+$item.InvokeVerb('delete')
+Start-Sleep -Seconds 1
+$still = @($folder.Items() | Where-Object { $_.Name -eq $leaf }) | Select-Object -First 1
+[pscustomobject]@{ ok = (-not [bool]$still); pending = [bool]$still; name = $leaf } | ConvertTo-Json -Compress`;
+    const r = await mtpPowerShell(body, { device, path: Array.isArray(pathParts) ? pathParts : [], leaf }, 15000);
+    if (r && r.timeout) return { ok: false, pending: true, error: 'DELETE_TIMEOUT' };
+    return r;
+  });
   // «Найти порт» — быстрый свип с ранним выходом (~1–2 с вместо ~24 с)
   ipcMain.handle('adb:port-scan', async (_e, host) => adb.portScanFast(host));
   ipcMain.handle('adb:auto-pair', async (_e, host, code, port) => {
@@ -1446,46 +1759,194 @@ if (key === 'autostart') return setAutostart(!!value);
     return r;
   });
 
+  function scrcpyExeForRecord() {
+    const candidates = [];
+    if (config.scrcpyPath) candidates.push(config.scrcpyPath);
+    if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'scrcpy', 'scrcpy.exe'));
+    candidates.push(path.join(__dirname, 'scrcpy-bundle', 'scrcpy.exe'));
+    for (const c of candidates) {
+      try { if (c && fs.existsSync(c)) return c; } catch (e) {}
+    }
+    return null;
+  }
+
+  function psRun(script, timeout) {
+    return new Promise(resolve => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script],
+        { windowsHide: true, timeout: timeout || 10000 },
+        (err, stdout, stderr) => resolve({
+          ok: !err,
+          out: String(stdout || '').trim(),
+          err: String(stderr || (err && err.message) || '')
+        }));
+    });
+  }
+
+  async function hideScrcpyWindow(pid) {
+    const script = [
+      'Add-Type @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public class ScrcpyRecWin {',
+      '  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);',
+      '}',
+      '"@',
+      '$p = Get-Process -Id ' + Number(pid) + ' -ErrorAction SilentlyContinue',
+      'if (-not $p) { exit 2 }',
+      'for ($i = 0; $i -lt 100; $i++) {',
+      '  $p.Refresh()',
+      '  $h = $p.MainWindowHandle',
+      '  if ($h -ne [IntPtr]::Zero) { [void][ScrcpyRecWin]::ShowWindow($h, 0); [Console]::WriteLine($h.ToInt64()); exit 0 }',
+      '  Start-Sleep -Milliseconds 100',
+      '}',
+      'exit 1'
+    ].join('\n');
+    const r = await psRun(script, 14000);
+    const h = parseInt(r.out, 10);
+    return Number.isFinite(h) && h > 0 ? h : 0;
+  }
+
+  async function closeScrcpyWindow(pid, hwnd) {
+    const script = [
+      'Add-Type @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public class ScrcpyRecMsg {',
+      '  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);',
+      '}',
+      '"@',
+      '$h = [IntPtr]::new(' + Number(hwnd || 0) + ')',
+      'if ($h -eq [IntPtr]::Zero) {',
+      '  $p = Get-Process -Id ' + Number(pid) + ' -ErrorAction SilentlyContinue',
+      '  if ($p) { $h = $p.MainWindowHandle }',
+      '}',
+      'if ($h -ne [IntPtr]::Zero -and [ScrcpyRecMsg]::PostMessage($h, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) { "OK" } else { "FAIL" }'
+    ].join('\n');
+    const r = await psRun(script, 8000);
+    return r.ok && r.out.indexOf('OK') >= 0;
+  }
+  closeScrcpyWindowFn = closeScrcpyWindow;
+
+  function waitChildClose(child, ms) {
+    return new Promise(resolve => {
+      if (!child || child.exitCode !== null) return resolve(true);
+      let done = false;
+      const timer = setTimeout(() => { if (!done) { done = true; resolve(false); } }, ms);
+      child.once('close', () => { if (!done) { done = true; clearTimeout(timer); resolve(true); } });
+    });
+  }
+
+  async function waitForFile(file, ms) {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      try { if (fs.existsSync(file) && fs.statSync(file).size > 1024) return true; } catch (e) {}
+      await sleep(150);
+    }
+    return false;
+  }
+
   ipcMain.handle('tools:record-start', async (_e, serial) => {
     if (recordChild) return { ok: false, error: 'Запись уже идёт' };
-    // (F3): пишем в подпапку Movies, а не в корень /sdcard — раньше брошенная
-    // при выходе запись оставляла в корне «муляжный» битый mp4. Старые хвосты вычищаем.
-    const recDir = '/sdcard/Movies/ADB-WiFi-Connector';
-    await adb.shellRun(serial, ['mkdir', '-p', recDir], { timeout: 10000 }).catch(() => {});
-    // старые файлы прошлого формата — в мусор безусловно; свои же недописанные хвосты
-    // (W4-ревизор) удаляем только если они старше 5 минут — вдруг запись оборвалась,
-    // но файл валиден и нужен владельцу
-    await adb.run(['-s', serial, 'shell', 'rm -f /sdcard/adb_wifi_connector_ru_*.mp4 2>/dev/null'], { timeout: 10000 }).catch(() => {});
-    await adb.run(['-s', serial, 'shell', `find '${recDir}' -name 'adb_wifi_ru_*.mp4' -mmin +5 -delete 2>/dev/null || true`], { timeout: 10000 }).catch(() => {});
-    const remote = `${recDir}/adb_wifi_ru_${Date.now()}.mp4`;
-    recordMeta = { serial, remote, startedAt: Date.now() };
-    const child = adb.startRecord(serial, remote);
+    const exe = scrcpyExeForRecord();
+    if (!exe) return { ok: false, error: 'scrcpy.exe не найден — запись со звуком недоступна' };
+    const local = path.join(app.getPath('temp'), `adb-wifi-record-${Date.now()}.mp4`);
+    const args = [
+      '-s', String(serial),
+      '--no-audio-playback',
+      '--audio-source=playback',
+      '--audio-dup',
+      '--audio-codec=aac',
+      '--audio-bit-rate=128K',
+      '--require-audio',
+      '--window-width=480',
+      '--window-height=270',
+      '--window-borderless',
+      '--time-limit=180',
+      '--record=' + local
+    ];
+    let child;
+    try {
+      child = spawn(exe, args, { windowsHide: true, cwd: path.dirname(exe) });
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+    const meta = { serial, local, startedAt: Date.now(), hwnd: 0, err: '' };
     recordChild = child;
-    // screenrecord сам умирает по --time-limit 180: честно сообщаем renderer
+    recordMeta = meta;
+    const collect = d => { meta.err = (meta.err + d.toString()).slice(-3000); };
+    child.stderr.on('data', collect);
+    child.stdout.on('data', collect);
+    child.on('error', e => {
+      meta.err = (meta.err + ' ' + e.message).slice(-3000);
+      if (recordChild === child) { recordChild = null; recordMeta = null; }
+    });
     child.on('close', () => {
       if (recordChild !== child) return;
       recordChild = null;
-      const meta = recordMeta; recordMeta = null;
-      sendTask({ kind: 'record-stopped', auto: true, serial: meta && meta.serial, remote: meta && meta.remote, elapsedSec: meta ? Math.round((Date.now() - meta.startedAt) / 1000) : 0 });
+      const m = recordMeta;
+      recordMeta = null;
+      if (!m) return;
+      let finalFile = '';
+      try {
+        if (fs.existsSync(m.local) && fs.statSync(m.local).size > 1024) {
+          finalFile = path.join(CAPTURES, `record-${stamp()}.mp4`);
+          fs.renameSync(m.local, finalFile);
+        }
+      } catch (e) {}
+      sendTask({
+        kind: 'record-stopped',
+        auto: true,
+        file: finalFile,
+        error: finalFile ? '' : 'Запись не создана',
+        elapsedSec: Math.round((Date.now() - m.startedAt) / 1000)
+      });
     });
-    return { ok: true, remote, maxSec: 180 };
+    meta.hwnd = await hideScrcpyWindow(child.pid);
+    const started = await waitForFile(local, 9000);
+    if (!started) {
+      if (recordChild === child) { recordChild = null; recordMeta = null; }
+      await closeScrcpyWindow(child.pid, meta.hwnd);
+      await waitChildClose(child, 3000);
+      try { child.kill('SIGKILL'); } catch (e) {}
+      try { fs.unlinkSync(local); } catch (e) {}
+      const detail = meta.err.split(/\r?\n/).filter(Boolean).slice(-2).join(' ');
+      return { ok: false, error: 'Не удалось начать запись со звуком' + (detail ? ': ' + detail : '') };
+    }
+    return { ok: true, maxSec: 180, audio: true };
   });
   ipcMain.handle('tools:record-stop', async () => {
     const child = recordChild;
     const meta = recordMeta;
     if (!child || !meta) return { ok: false, error: 'Запись не идёт' };
-    // обнуляем ДО kill: close старого процесса не должен считаться авто-остановкой
     recordChild = null; recordMeta = null;
-    try { child.kill('SIGINT'); } catch (e) {}
-    await new Promise(r => setTimeout(r, 1200));
+    const closed = await closeScrcpyWindow(child.pid, meta.hwnd);
+    if (!closed) { try { child.kill('SIGKILL'); } catch (e) {} }
+    const exited = await waitChildClose(child, 7000);
+    if (!exited) {
+      try { child.kill('SIGKILL'); } catch (e) {}
+      await waitChildClose(child, 1500);
+      try { fs.unlinkSync(meta.local); } catch (e) {}
+      return { ok: false, error: 'scrcpy не завершил запись' };
+    }
+    await sleep(250);
+    let size = 0;
+    try { size = fs.statSync(meta.local).size; } catch (e) {}
+    if (!size) return { ok: false, error: 'Файл записи не создан' };
     const file = await dialog.showSaveDialog(win, {
       defaultPath: path.join(CAPTURES, `record-${stamp()}.mp4`),
       filters: [{ name: 'Видео MP4', extensions: ['mp4'] }]
     });
-    if (file.canceled) { adb.run(['-s', meta.serial, 'shell', 'rm', '-f', meta.remote]).catch?.(() => {}); return { ok: false, canceled: true }; }
-    const pulled = await adb.pull(meta.serial, meta.remote, file.filePath);
-    adb.run(['-s', meta.serial, 'shell', 'rm', '-f', meta.remote]);
-    return pulled.ok ? { ok: true, file: file.filePath } : { ok: false, error: pulled.message };
+    if (file.canceled) {
+      try { fs.unlinkSync(meta.local); } catch (e) {}
+      return { ok: false, canceled: true };
+    }
+    try {
+      fs.copyFileSync(meta.local, file.filePath);
+      fs.unlinkSync(meta.local);
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+    return { ok: true, file: file.filePath };
   });
 
   ipcMain.handle('tools:logcat-start', async (_e, serial) => {
@@ -1538,6 +1999,427 @@ if (key === 'autostart') return setAutostart(!!value);
       return { ok: true };
     }
     catch (e) { return { ok: false, error: e.message }; }
+  });
+
+  // ----- камера телефона (страница «Камера») -----
+  const cameraScript = path.join(__dirname, 'camera', 'phonecam_server.py');
+  const cameraOrigin = 'http://127.0.0.1:27190';
+
+  async function findPythonw() {
+    const found = await new Promise(resolve => {
+      execFile('where.exe', ['pythonw.exe'], { windowsHide: true }, (err, out) => {
+        resolve(err ? null : (out || '').trim().split(/\r?\n/)[0] || null);
+      });
+    });
+    if (found) return found;
+    try {
+      const base = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Python');
+      for (const dir of fs.readdirSync(base)) {
+        const exe = path.join(base, dir, 'pythonw.exe');
+        if (fs.existsSync(exe)) return exe;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function cameraStatus() {
+    return new Promise(resolve => {
+      let done = false;
+      const finish = (value) => { if (!done) { done = true; resolve(value); } };
+      const req = http.get(cameraOrigin + '/status', { timeout: 1800 }, res => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => {
+          try { finish({ ok: true, ...JSON.parse(body) }); }
+          catch (e) { finish({ ok: false, error: 'Некорректный ответ сервера камеры' }); }
+        });
+      });
+      req.on('timeout', () => { req.destroy(); finish({ ok: false, error: 'Сервер камеры не отвечает' }); });
+      req.on('error', (e) => finish({ ok: false, error: e.message }));
+    });
+  }
+
+  function serverShutdown(origin) {
+    return new Promise(resolve => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(true); } };
+      const req = http.get(origin + '/shutdown', { timeout: 1200 }, res => {
+        res.resume();
+        res.on('end', finish);
+      });
+      req.on('timeout', () => { req.destroy(); finish(); });
+      req.on('error', finish);
+    });
+  }
+
+  function driversStatus() {
+    return new Promise(resolve => {
+      const videoExe = path.join(__dirname, 'camera', 'bin', 'PhoneVirtualCam.exe');
+      const videoDll = path.join(__dirname, 'camera', 'bin', 'VirtualCameraSource.dll');
+      const audioSetup = path.join(__dirname, 'camera', 'drivers', 'VBCABLE', 'VBCABLE_Setup_x64.exe');
+      const video = fs.existsSync(videoExe) && fs.existsSync(videoDll);
+      const ps = "$d = Get-CimInstance Win32_SoundDevice | Where-Object { $_.Name -match 'VB-Audio' }; if ($d) { '1' } else { '0' }";
+      execFile('powershell.exe', ['-NoProfile', '-Command', ps], { windowsHide: true, timeout: 15000 }, (err, out) => {
+        const audio = !err && String(out || '').trim() === '1';
+        resolve({
+          ok: true,
+          video: { installed: video, bundled: video, exe: videoExe, dll: videoDll },
+          audio: { installed: audio, setup: fs.existsSync(audioSetup), setupPath: audioSetup }
+        });
+      });
+    });
+  }
+
+  async function pickCameraSerial(serial) {
+    const requested = String(serial || '').trim();
+    if (requested) return requested;
+    try {
+      const d = await adb.devices();
+      const entry = (d.list || []).find(x => x.state === 'device') || (d.list || [])[0];
+      return entry ? entry.serial : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  ipcMain.handle('camera:start', async (_e, camera, options, serial) => {
+    if (!fs.existsSync(cameraScript)) {
+      return { ok: false, error: 'Файл camera/phonecam_server.py не найден' };
+    }
+    const pythonw = await findPythonw();
+    if (!pythonw) {
+      return { ok: false, error: 'Python 3 не найден. Для встроенной камеры нужен Python с OpenCV.' };
+    }
+    const prev = cameraProc;
+    cameraProc = null;
+    if (prev) {
+      await serverShutdown(cameraOrigin);
+      try { prev.removeAllListeners('exit'); prev.kill(); } catch (e) {}
+      await new Promise(r => setTimeout(r, 260));
+    }
+    const targetSerial = await pickCameraSerial(serial);
+    const cam = Math.max(0, Math.min(7, Number(camera) || 0));
+    const width = Math.max(320, Math.min(3840, Number(options && options.width) || 1280));
+    const height = Math.max(240, Math.min(2160, Number(options && options.height) || 720));
+    const fps = Math.max(15, Math.min(120, Number(options && options.fps) || 60));
+    const child = spawn(pythonw, [
+      cameraScript,
+      '--port', '27190',
+      '--camera', String(cam),
+      '--width', String(width),
+      '--height', String(height),
+      '--fps', String(fps),
+      '--adb', adb.getAdbPath() || '',
+      '--serial', targetSerial
+    ], {
+      cwd: path.dirname(cameraScript),
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    cameraProc = child;
+    child.on('error', () => {
+      if (cameraProc === child) cameraProc = null;
+    });
+    child.on('exit', () => {
+      if (cameraProc === child) cameraProc = null;
+    });
+    return { ok: true, port: 27190, camera: cam, serial: targetSerial };
+  });
+
+  ipcMain.handle('camera:install', async (_e, serial) => {
+    const apk = path.join(__dirname, 'camera', 'android-cam.apk');
+    if (!fs.existsSync(apk)) {
+      return { ok: false, error: 'Файл camera/android-cam.apk не найден' };
+    }
+    const target = await pickCameraSerial(serial);
+    if (!target) return { ok: false, error: 'Телефон не найден. Подключите его по ADB.' };
+    const r = await adb.run(['-s', target, 'install', '-r', '-g', apk], { timeout: 180000 });
+    const output = String((r.stdout || '') + (r.stderr || '')).trim().slice(-500);
+    return { ok: !!r.ok, serial: target, output, error: r.ok ? '' : (output || 'adb install завершился с ошибкой') };
+  });
+
+  ipcMain.handle('camera:stop', async () => {
+    await serverShutdown(cameraOrigin);
+    const child = cameraProc;
+    cameraProc = null;
+    if (child) {
+      try { child.removeAllListeners('exit'); child.kill(); } catch (e) {}
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('camera:status', async () => cameraStatus());
+
+  function cameraCaptureDir() {
+    const dir = path.join(__dirname, 'camera', 'captures');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  function cameraCaptureStamp() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  function toIpcBuffer(data) {
+    if (Buffer.isBuffer(data)) return data;
+    if (data instanceof ArrayBuffer) return Buffer.from(data);
+    if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    if (data && data.type === 'Buffer' && Array.isArray(data.data)) return Buffer.from(data.data);
+    return Buffer.from(data || []);
+  }
+
+  ipcMain.handle('camera:save-photo', async (_e, dataUrl) => {
+    try {
+      const match = String(dataUrl || '').match(/^data:image\/(png|jpeg);base64,(.+)$/);
+      if (!match) return { ok: false, error: 'Некорректный кадр' };
+      const ext = match[1] === 'jpeg' ? 'jpg' : 'png';
+      const file = path.join(cameraCaptureDir(), `camera-photo-${cameraCaptureStamp()}.${ext}`);
+      fs.writeFileSync(file, Buffer.from(match[2], 'base64'));
+      return { ok: true, path: file };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle('camera:save-video', async (_e, data, mime) => {
+    try {
+      const buffer = toIpcBuffer(data);
+      if (!buffer.length) return { ok: false, error: 'Пустой видеофайл' };
+      const ext = /mp4/i.test(String(mime || '')) ? 'mp4' : 'webm';
+      const file = path.join(cameraCaptureDir(), `camera-video-${cameraCaptureStamp()}.${ext}`);
+      fs.writeFileSync(file, buffer);
+      return { ok: true, path: file };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle('camera:open-captures', async () => {
+    try {
+      const dir = cameraCaptureDir();
+      const error = await shell.openPath(dir);
+      return error ? { ok: false, error } : { ok: true, path: dir };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle('drivers:status', async () => driversStatus());
+
+  ipcMain.handle('drivers:install-audio', async () => {
+    const setup = path.join(__dirname, 'camera', 'drivers', 'VBCABLE', 'VBCABLE_Setup_x64.exe');
+    if (!fs.existsSync(setup)) {
+      return { ok: false, error: 'Установщик VB-CABLE не найден в комплекте' };
+    }
+    const ps = `Start-Process -FilePath '${setup.replace(/'/g, "''")}' -ArgumentList '-i','-h' -Verb RunAs -Wait`;
+    return new Promise(resolve => {
+      execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+        windowsHide: true,
+        timeout: 180000
+      }, (err, stdout, stderr) => {
+        const output = String((stdout || '') + (stderr || '')).trim();
+        resolve({ ok: !err, error: err ? (output || err.message) : '', output });
+      });
+    });
+  });
+
+  ipcMain.handle('drivers:uninstall-audio', async () => {
+    const setup = path.join(__dirname, 'camera', 'drivers', 'VBCABLE', 'VBCABLE_Setup_x64.exe');
+    if (!fs.existsSync(setup)) {
+      return { ok: false, error: 'Установщик VB-CABLE не найден в комплекте' };
+    }
+    const ps = `Start-Process -FilePath '${setup.replace(/'/g, "''")}' -ArgumentList '-u','-h' -Verb RunAs -Wait`;
+    return new Promise(resolve => {
+      execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+        windowsHide: true,
+        timeout: 180000
+      }, (err, stdout, stderr) => {
+        const output = String((stdout || '') + (stderr || '')).trim();
+        resolve({ ok: !err, error: err ? (output || err.message) : '', output });
+      });
+    });
+  });
+
+  ipcMain.handle('drivers:open-audio', async () => {
+    const script = path.join(__dirname, 'camera', 'PhoneAudio.py');
+    if (!fs.existsSync(script)) {
+      return { ok: false, error: 'Файл camera/PhoneAudio.py не найден' };
+    }
+    const pythonw = await findPythonw();
+    if (!pythonw) {
+      return { ok: false, error: 'Python 3 не найден. Для микрофона нужен Python с sounddevice.' };
+    }
+    const target = await pickCameraSerial('');
+    const args = [script, '--adb', adb.getAdbPath() || ''];
+    if (target) args.push('--serial', target);
+    try {
+      const child = spawn(pythonw, args, {
+        cwd: path.dirname(script),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false
+      });
+      child.unref();
+      return { ok: true, serial: target };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  const audioScript = path.join(__dirname, 'camera', 'phoneaudio_server.py');
+  const audioOrigin = 'http://127.0.0.1:27191';
+
+  function audioStatus() {
+    return new Promise(resolve => {
+      const req = http.get(audioOrigin + '/status', { timeout: 1800 }, res => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => {
+          try { resolve({ ok: true, ...JSON.parse(body) }); }
+          catch (e) { resolve({ ok: false, error: 'Некорректный ответ аудиосервера' }); }
+        });
+      });
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'Аудиосервер не отвечает' }); });
+      req.on('error', e => resolve({ ok: false, error: e.message }));
+    });
+  }
+
+  ipcMain.handle('audio:start', async (_e, serial) => {
+    if (!fs.existsSync(audioScript)) {
+      return { ok: false, error: 'Файл camera/phoneaudio_server.py не найден' };
+    }
+    const current = await audioStatus();
+    if (current && current.ok) return { ok: true, already: true, ...current };
+    const pythonw = await findPythonw();
+    if (!pythonw) {
+      return { ok: false, error: 'Python 3 не найден. Для микрофона нужен Python с sounddevice.' };
+    }
+    const prev = audioProc;
+    audioProc = null;
+    if (prev) {
+      await serverShutdown(audioOrigin);
+      try { prev.removeAllListeners('exit'); prev.kill(); } catch (e) {}
+      await new Promise(r => setTimeout(r, 260));
+    }
+    const targetSerial = await pickCameraSerial(serial);
+    const child = spawn(pythonw, [
+      audioScript,
+      '--port', '27191',
+      '--adb', adb.getAdbPath() || '',
+      '--serial', targetSerial
+    ], {
+      cwd: path.dirname(audioScript),
+      stdio: 'ignore',
+      windowsHide: true
+    });
+    audioProc = child;
+    child.on('error', () => { if (audioProc === child) audioProc = null; });
+    child.on('exit', () => { if (audioProc === child) audioProc = null; });
+    return { ok: true, port: 27191, serial: targetSerial };
+  });
+
+  ipcMain.handle('audio:stop', async () => {
+    await serverShutdown(audioOrigin);
+    const child = audioProc;
+    audioProc = null;
+    if (child) {
+      try { child.removeAllListeners('exit'); child.kill(); } catch (e) {}
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('audio:status', async () => audioStatus());
+
+  ipcMain.handle('audio:open-recordings', async () => {
+    const dir = path.join(__dirname, 'camera', 'recordings');
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const { shell } = require('electron');
+      const error = await shell.openPath(dir);
+      return error ? { ok: false, error } : { ok: true, path: dir };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  });
+
+  const winAudioScript = path.join(__dirname, 'camera', 'win-audio.ps1');
+
+  function runWinAudio(args) {
+    return new Promise(resolve => {
+      if (!fs.existsSync(winAudioScript)) {
+        resolve({ ok: false, error: 'Файл camera/win-audio.ps1 не найден' });
+        return;
+      }
+      execFile('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', winAudioScript, ...args
+      ], { windowsHide: true, timeout: 30000 }, (err, stdout, stderr) => {
+        const out = String(stdout || '').trim();
+        const errText = String(stderr || '').trim();
+        if (err) resolve({ ok: false, error: errText || err.message, stdout: out });
+        else resolve({ ok: true, stdout: out });
+      });
+    });
+  }
+
+  ipcMain.handle('audio:system-mics', async () => {
+    const r = await runWinAudio(['list']);
+    if (!r.ok) return r;
+    try {
+      const parsed = JSON.parse(r.stdout || '[]');
+      const devices = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+      return { ok: true, devices };
+    } catch (e) {
+      return { ok: false, error: 'Не удалось разобрать список микрофонов', raw: r.stdout };
+    }
+  });
+
+  ipcMain.handle('audio:set-default-mic', async (_e, id) => {
+    const deviceId = String(id || '').trim();
+    if (!deviceId) return { ok: false, error: 'Не выбрано устройство' };
+    const r = await runWinAudio(['set', deviceId]);
+    return r.ok ? { ok: true } : r;
+  });
+
+  ipcMain.handle('audio:rename-mic', async (_e, id, name) => {
+    const deviceId = String(id || '').trim();
+    const newName = String(name || '').trim() || 'Микрофон Android';
+    if (!deviceId) return { ok: false, error: 'Не выбрано устройство' };
+    const quote = (value) => String(value).replace(/'/g, "''");
+    const inner = `$p = '${quote(winAudioScript)}'; & $p rename '${quote(deviceId)}' '${quote(newName)}'; exit $LASTEXITCODE`;
+    const encoded = Buffer.from(inner, 'utf16le').toString('base64');
+    const outer = `$p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${encoded}'; exit $p.ExitCode`;
+    return new Promise(resolve => {
+      execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', outer], {
+        windowsHide: true,
+        timeout: 120000
+      }, (err, stdout, stderr) => {
+        if (err) {
+          const details = String(stderr || '').trim() || err.message;
+          resolve({ ok: false, error: 'Переименование не выполнено: ' + details });
+        } else {
+          resolve({ ok: true });
+        }
+      });
+    });
+  });
+
+  ipcMain.handle('audio:open-sound-settings', async () => {
+    try {
+      const child = spawn('rundll32.exe', ['shell32.dll,Control_RunDLL', 'mmsys.cpl,,1'], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false
+      });
+      child.unref();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   });
 
   ipcMain.handle('clip:start', async (_e, serial) => clipStart(serial));
@@ -1761,6 +2643,127 @@ if (key === 'autostart') return setAutostart(!!value);
   ipcMain.handle('input:swipe', async (_e, serial, x1, y1, x2, y2, ms) => adb.run(['-s', serial, 'shell', 'input', 'swipe', String(x1), String(y1), String(x2), String(y2), String(ms)], { timeout: 8000 }));
   ipcMain.handle('input:key', async (_e, serial, key) => adb.run(['-s', serial, 'shell', 'input', 'keyevent', String(key)], { timeout: 5000 }));
 
+  async function devGet(serial, key) {
+    const r = await adb.run(['-s', serial, 'shell', 'settings', 'get', 'global', key], { timeout: 8000 });
+    return (r.stdout || '').trim();
+  }
+  async function devPut(serial, key, value) {
+    const r = await adb.run(['-s', serial, 'shell', 'settings', 'put', 'global', key, String(value)], { timeout: 8000 });
+    return r.ok;
+  }
+  async function devTapBuildNumber(serial) {
+    const tmp = path.join(os.tmpdir(), 'adbwc-dev-' + Date.now() + '.xml');
+    try {
+      await adb.run(['-s', serial, 'shell', 'am', 'start', '-a', 'android.settings.DEVICE_INFO_SETTINGS'], { timeout: 10000 });
+      await sleep(1200);
+      const sz = await adb.run(['-s', serial, 'shell', 'wm', 'size'], { timeout: 8000 });
+      const mm = /(\d+)x(\d+)/.exec(sz.stdout || '');
+      const w = mm ? +mm[1] : 1080, h = mm ? +mm[2] : 1920;
+      const re = /(номер сборки|build number|версия hyperos|hyperos|версия miui|miui|build)/i;
+      for (let i = 0; i < 5; i++) {
+        const d = await adb.run(['-s', serial, 'shell', 'uiautomator', 'dump', '/sdcard/adbwc_dev.xml'], { timeout: 15000 });
+        if (!d.ok) return false;
+        const p = await adb.run(['-s', serial, 'pull', '/sdcard/adbwc_dev.xml', tmp], { timeout: 15000 });
+        if (!p.ok) return false;
+        const xml = fs.readFileSync(tmp, 'utf8');
+        const hits = [...xml.matchAll(/<node[^>]*text="([^"]*)"[^>]*bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/g)]
+          .map(m => ({ text: m[1], x1: +m[2], y1: +m[3], x2: +m[4], y2: +m[5] }))
+          .filter(n => n.text && re.test(n.text));
+        if (hits.length) {
+          const n = hits[0];
+          const x = Math.round((n.x1 + n.x2) / 2), y = Math.round((n.y1 + n.y2) / 2);
+          for (let k = 0; k < 7; k++) { await adb.run(['-s', serial, 'shell', 'input', 'tap', String(x), String(y)], { timeout: 5000 }); await sleep(180); }
+          await sleep(900);
+          return true;
+        }
+        await adb.run(['-s', serial, 'shell', 'input', 'swipe', String(Math.round(w / 2)), String(Math.round(h * 0.75)), String(Math.round(w / 2)), String(Math.round(h * 0.3)), '300'], { timeout: 8000 });
+        await sleep(600);
+      }
+      return false;
+    } finally { try { fs.unlinkSync(tmp); } catch (e) {} }
+  }
+  ipcMain.handle('dev:state', async (_e, serial) => {
+    if (!serial) return { ok: false, error: 'Нет устройства' };
+    const dev = await devGet(serial, 'development_settings_enabled');
+    const adbOn = await devGet(serial, 'adb_enabled');
+    return { ok: true, dev: dev === '1', adb: adbOn === '1' };
+  });
+  async function devDetect() {
+    const out = { adb: [], usb: [], wifi: [], lan: [] };
+    const d = await adb.run(['devices', '-l'], { timeout: 8000 }).catch(() => null);
+    for (const line of String((d && d.stdout) || '').split(/\r?\n/)) {
+      const m = /^(\S+)\s+device\b(.*)$/.exec(line.trim());
+      if (m) out.adb.push({ serial: m[1], info: m[2].trim() });
+    }
+    const ps = (script) => new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', script], { windowsHide: true, timeout: 15000 }, (err, stdout) => resolve({ ok: !err, out: String(stdout || '') }));
+    });
+    const pnp = await pnpAndroidUsb();
+    out.usb = pnp;
+    const lan = await ps("$ifs = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | ForEach-Object { $_.InterfaceAlias } | Select-Object -Unique); if (-not $ifs.Count) { $ifs = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceAlias }) }; Get-NetNeighbor -InterfaceAlias $ifs -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object IPAddress,LinkLayerAddress,State | ConvertTo-Json -Compress");
+    if (lan.ok && lan.out.trim()) {
+      try {
+        const a = JSON.parse(lan.out);
+        const OK = new Set([3, 4, 5]);   // Delay, Stale, Reachable
+        out.lan = (Array.isArray(a) ? a : [a])
+          .map(x => ({ ip: x.IPAddress, mac: x.LinkLayerAddress, state: x.State }))
+          .filter(x => x.ip && !/^(224|239|255|127|0|169\.254)\./.test(x.ip) && !/\.255$/.test(x.ip))
+          .filter(x => x.mac && x.mac !== '00-00-00-00-00-00' && x.mac !== 'FF-FF-FF-FF-FF-FF')
+          .filter(x => OK.has(Number(x.state)))
+          .slice(0, 8);
+      } catch (e) {}
+    }
+    try {
+      out.wifi = (await mergedDiscover())
+        .filter(x => x && (/_adb|adb/i.test(String(x.service || '')) || x.src === 'adb-mdns'))
+        .map(x => ({ host: x.host, port: x.port, service: x.service, src: x.src }));
+    } catch (e) {}
+    return { ok: true, ...out };
+  }
+  async function devEnable(serial) {
+    if (!serial) {
+      const d = await adb.run(['devices'], { timeout: 8000 });
+      const line = String(d.stdout || '').split(/\r?\n/).find(l => /\sdevice$/.test(l));
+      serial = line ? line.trim().split(/\s+/)[0] : '';
+    }
+    if (!serial) return { ok: false, error: 'Телефон не найден по ADB. Подключите его по USB или через QR/Wi-Fi — одной сети Wi-Fi без отладки недостаточно.' };
+    let dev = (await devGet(serial, 'development_settings_enabled')) === '1';
+    let method = dev ? 'already' : '';
+    if (!dev) {
+      await devPut(serial, 'development_settings_enabled', 1);
+      await devPut(serial, 'adb_enabled', 1);
+      dev = (await devGet(serial, 'development_settings_enabled')) === '1';
+      method = 'settings';
+    } else {
+      await devPut(serial, 'adb_enabled', 1);
+    }
+    if (!dev) {
+      const tapped = await devTapBuildNumber(serial);
+      dev = tapped && (await devGet(serial, 'development_settings_enabled')) === '1';
+      if (dev) method = 'tap';
+    }
+    if (!dev) return { ok: false, error: 'Не удалось включить режим разработчика. Разблокируйте телефон и попробуйте ещё раз.' };
+    await devPut(serial, 'adb_enabled', 1);
+    await adb.run(['-s', serial, 'shell', 'am', 'start', '-a', 'android.settings.APPLICATION_DEVELOPMENT_SETTINGS'], { timeout: 10000 });
+    let wifi = null;
+    if (!/^\d+\.\d+\.\d+\.\d+/.test(serial)) {
+      try {
+        const ipr = await adb.run(['-s', serial, 'shell', 'ip', 'route', 'get', '1.1.1.1'], { timeout: 8000 });
+        const ipm = /src\s+(\d+\.\d+\.\d+\.\d+)/.exec(ipr.stdout || '');
+        if (ipm) {
+          await adb.run(['-s', serial, 'tcpip', '5555'], { timeout: 10000 });
+          await sleep(800);
+          const cr = await adb.run(['connect', ipm[1] + ':5555'], { timeout: 10000 });
+          wifi = { host: ipm[1], port: 5555, ok: cr.ok, out: (cr.stdout || '').trim() };
+        }
+      } catch (e) {}
+    }
+    return { ok: true, dev: true, adb: true, method, wifi };
+  }
+  ipcMain.handle('dev:detect', () => devDetect());
+  ipcMain.handle('dev:enable', (_e, serial) => devEnable(serial));
+  devDetectFn = devDetect;
+
   /* ================= свои команды терминала (F16): строго в «Сохранения/» ================= */
   let customCmds = loadJson(CMDS_FILE, []); // [{name, cmd}]
   ipcMain.handle('cmds:list', async () => customCmds);
@@ -1788,8 +2791,9 @@ if (key === 'autostart') return setAutostart(!!value);
     const exe = adb.getAdbPath();
     const child = require('child_process').spawn(exe, ['-s', serial, 'shell'], { windowsHide: true });
     shellChild = child;
-    child.stdout.on('data', d => { if (win && !win.isDestroyed()) win.webContents.send('shell:out', d.toString('utf8')); });
-    child.stderr.on('data', d => { if (win && !win.isDestroyed()) win.webContents.send('shell:out', d.toString('utf8')); });
+    const emit = d => { if (win && !win.isDestroyed()) win.webContents.send('shell:out', { serial, data: d.toString('utf8') }); };
+    child.stdout.on('data', emit);
+    child.stderr.on('data', emit);
     child.on('close', () => { if (shellChild === child) { shellChild = null; sendTask({ kind: 'shell-stopped' }); } });
     return { ok: true };
   });
@@ -1812,8 +2816,11 @@ if (key === 'autostart') return setAutostart(!!value);
     const d = normalizeFsDir(dir);
     const dirArg = d === '/' ? '/' : d + '/';
     let r = await adb.shellRun(serial, ['ls', '-lAp', dirArg], { timeout: 15000 });
-    if (!r.ok || !(r.stdout || '').trim()) r = await adb.shellRun(serial, ['ls', '-la', dirArg], { timeout: 15000 });
-    if (!r.ok) logErr('fs:list', serial, d, (r.stderr || r.error || '').slice(0, 200));
+    // если stdout пуст — пробуем без -p; stderr с Permission denied при этом
+    // не означает, что весь каталог недоступен: ls может отдать часть файлов.
+    if (!(r.stdout || '').trim()) r = await adb.shellRun(serial, ['ls', '-la', dirArg], { timeout: 15000 });
+    const stderr = String(r.stderr || '').trim();
+    const denied = /permission denied/i.test(stderr);
     const items = [];
     // toybox ls -l на Android: perms links user group size date name
     // (колонка links есть почти всегда; старые сборки — без неё; дата: «2024-05-01 10:12», «May 1 10:12» или «05-01 10:12»)
@@ -1854,7 +2861,17 @@ if (key === 'autostart') return setAutostart(!!value);
       }
     }
     items.sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
-    return { ok: r.ok, items, path: d, error: r.ok ? null : (r.stderr || '').slice(0, 200) };
+    // ls возвращает ненулевой код, если не смог прочитать отдельные записи, но
+    // stdout при этом содержит нормальный список. Считаем каталог открытым,
+    // если есть элементы или строка total (пустая папка).
+    const listingOk = r.ok || items.length > 0 || /(^|\n)total\s+\d+/m.test(String(r.stdout || ''));
+    if (!listingOk) logErr('fs:list', serial, d, (stderr || r.error || '').slice(0, 200));
+    const err = listingOk ? null : (denied
+      ? (d === '/data'
+        ? 'Раздел /data защищён Android: без root содержимое недоступно. Это не ошибка.'
+        : 'Нет доступа: раздел защищён — нужен root')
+      : (stderr || r.error || 'Не удалось прочитать папку').slice(0, 220));
+    return { ok: listingOk, items, path: d, error: err, denied };
   });
   ipcMain.handle('fs:pull', async (_e, serial, remote) => {
     const f = await dialog.showSaveDialog(win, { defaultPath: path.join(app.getPath('downloads'), path.basename(remote)) });
@@ -1886,10 +2903,11 @@ if (key === 'autostart') return setAutostart(!!value);
     const dst = String(p.dst || p.dstSerial || '');
     const paths = Array.isArray(p.paths) ? p.paths.map(String).filter(Boolean).slice(0, 200) : [];
     const dest = normalizeFsDir(p.dest || '/sdcard/Download');
+    const conflict = (p.conflict === 'replace' || p.conflict === 'rename') ? p.conflict : '';
     if (!src || !dst) return { ok: false, error: 'Не выбраны источник и получатель' };
     if (!paths.length) return { ok: false, error: 'Не выбраны файлы для передачи' };
     try {
-      const r = await phoneTransferMany(src, dst, paths, dest);
+      const r = await phoneTransferMany(src, dst, paths, dest, conflict);
       if (!r.ok) logErr('fs:phone-transfer', src, dst, (r.error || (r.items || []).map(x => x && x.error).filter(Boolean).join('; ')).slice(0, 300));
       return r;
     } catch (e) {
@@ -2240,13 +3258,15 @@ const map = {
       seen.add(p);
       mounts.push({ path: p, type, id: m[2] });
     }
-    // фолбэк/дополнение: физические папки в /storage (флешки вида XXXX-XXXX)
+    // фолбэк/дополнение: физические папки в /storage (флешки вида XXXX-XXXX).
+    // sdcard/sdcard0 — это симлинки на внутреннюю память, а не отдельные SD-карты;
+    // раньше они попадали в список как две «SD-карты» и путали выбор тома.
     const vols = [];
     for (const v of (ls.stdout || '').split(/\s+/).filter(Boolean)) {
-      if (v === 'emulated' || v === 'self') continue;
+      if (!/^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$/.test(v)) continue;
       vols.push(v);
       const p = '/storage/' + v;
-      if (!seen.has(p) && /^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$/.test(v)) {
+      if (!seen.has(p)) {
         seen.add(p);
         mounts.push({ path: p, type: 'public', id: v });
       }
@@ -2862,7 +3882,7 @@ const map = {
       // БЕЗ уведомлений и БЕЗ записей в логфайл на каждый файл
       const key = serialTag(serial) + '|' + remotePath + '|' + size;
       const hit = FS_ICON_MEM.get(key);
-      if (hit) return { ok: true, dataUrl: hit.dataUrl, label: hit.label, size, mtime: (parseInt(mt, 10) || 0) * 1000 };
+      if (hit) return { ok: true, ...hit, size, mtime: (parseInt(mt, 10) || 0) * 1000 };
       if (fsApkFail.has(key)) return { ok: false, reason: 'fail', size };
       const tmp = path.join(os.tmpdir(), 'icon-' + require('crypto').createHash('sha1').update(key).digest('hex').slice(0, 20) + '.apk');
       const pr = await adb.run(['-s', serial, 'pull', remotePath, tmp], { timeout: 900000 });
@@ -2872,14 +3892,16 @@ const map = {
       try { fs.unlinkSync(tmp); } catch (e) {}
       if (!meta || (!meta.icon && !meta.label)) { fsApkFail.add(key); return { ok: false, reason: 'meta', size }; }
       const dataUrl = meta.icon ? ('data:' + meta.icon.mime + ';base64,' + meta.icon.data.toString('base64')) : null;
-      if (FS_ICON_MEM.size >= 300 && !FS_ICON_MEM.has(key)) FS_ICON_MEM.delete(FS_ICON_MEM.keys().next().value);
-      FS_ICON_MEM.set(key, { dataUrl, label: meta.label || null });
-      return {
-        ok: true,
+      const packed = {
         dataUrl,
-        label: meta.label || null, package: meta.package || null, versionName: meta.versionName || null,
-        size, mtime: (parseInt(mt, 10) || 0) * 1000
+        label: meta.label || null,
+        package: meta.package || null,
+        versionName: meta.versionName || null,
+        versionCode: meta.versionCode || null
       };
+      if (FS_ICON_MEM.size >= 300 && !FS_ICON_MEM.has(key)) FS_ICON_MEM.delete(FS_ICON_MEM.keys().next().value);
+      FS_ICON_MEM.set(key, packed);
+      return { ok: true, ...packed, size, mtime: (parseInt(mt, 10) || 0) * 1000 };
     } catch (e) { return { ok: false, error: e.message }; }
   });
 
@@ -2907,10 +3929,25 @@ const map = {
   });
   ipcMain.handle('apk:phoneinstall', async (e, serial, remoteApk) => {
     // APK уже лежит НА ТЕЛЕФОНЕ — скачивать не нужно: pm install -r напрямую
-    const r = await adb.run(['-s', serial, 'shell', 'pm', 'install', '-r', adb.shq(remoteApk)], { timeout: 300000 });
+    const tmp = '/data/local/tmp/adbwifi-install-' + Date.now() + '.apk';
+    let r = { ok: false, stdout: '', stderr: '' };
+    try {
+      const cp = await adb.run(['-s', serial, 'shell', `cp ${adb.shq(remoteApk)} ${adb.shq(tmp)}`], { timeout: 120000 });
+      if (!cp.ok) {
+        r = { ok: false, stdout: cp.stdout || '', stderr: cp.stderr || cp.error || 'Не удалось скопировать APK во временную папку' };
+      } else {
+        r = await adb.run(['-s', serial, 'shell', 'pm', 'install', '-r', adb.shq(tmp)], { timeout: 300000 });
+      }
+    } finally {
+      adb.run(['-s', serial, 'shell', 'rm', '-f', adb.shq(tmp)], { timeout: 15000 }).catch(() => {});
+    }
+    const out = ((r.stdout || '') + '\n' + (r.stderr || '')).trim();
     const ok = r.ok && /success/i.test(r.stdout || '');
-    if (!ok) logErr('apk:phoneinstall', serial, remoteApk, ((r.stdout || '') + ' ' + (r.stderr || '')).slice(0, 160));
-    return { ok, message: ((r.stdout || r.stderr || '').trim().split('\n').pop() || (ok ? 'установлено' : 'ошибка установки')).slice(0, 200) };
+    const fail = out.match(/Failure\s*\[([^\]]+)\]/i);
+    const errLine = out.match(/Error:\s*([^\n]+)/i);
+    const msg = ok ? 'установлено' : (fail ? 'Failure [' + fail[1] + ']' : (errLine ? errLine[1].trim() : (out.split(/\r?\n/).pop() || 'ошибка установки')));
+    if (!ok) logErr('apk:phoneinstall', serial, remoteApk, out.slice(0, 500));
+    return { ok, message: msg.slice(0, 300), detail: out.slice(0, 4000) };
   });
 
   /* ================= мета локальных APK (иконка/имя/пакет/версия) ================= */
@@ -3112,19 +4149,58 @@ const map = {
   // кнопка «Открыть программу» в окошке установщика — поднимает главное окно и трей
   ipcMain.on('mini:open-main', () => {
     try {
-      if (!win || win.isDestroyed()) { miniOnly = false; createWindow(); }
-      else { win.show(); win.focus(); }
+      miniOnly = false;
+      showMainWindow();
       ensureTray();
       mainShown = true;
-      if (win && !win.isDestroyed()) { win.show(); win.focus(); }
     } catch (e) { logErr('mini:open-main', e.message); }
   });
 
   /* ================= собственное трей-меню (вместо системного) ================= */
-  ipcMain.on('traymenu:show', () => { try { if (win && !win.isDestroyed()) { win.show(); win.focus(); } } catch (e) {} if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); });
-  ipcMain.on('traymenu:scan', () => { try { if (win && !win.isDestroyed()) { win.show(); win.focus(); win.webContents.send('task:event', { kind: 'scan-request' }); } } catch (e) {} if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); });
-  ipcMain.on('traymenu:conn', () => { try { if (win && !win.isDestroyed()) { win.show(); win.focus(); win.webContents.send('task:event', { kind: 'open-connect' }); } } catch (e) {} if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); });
-  ipcMain.on('traymenu:sett', () => { try { if (win && !win.isDestroyed()) { win.show(); win.focus(); win.webContents.send('task:event', { kind: 'open-settings' }); } } catch (e) {} if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); });
+  ipcMain.handle('tray:state', async () => {
+    let list = [];
+    try {
+      const r = await adb.devices();
+      list = (r.list || []).filter(d => d.state === 'device');
+    } catch (e) {}
+    const devices = await Promise.all(list.map(async d => {
+      let model = (d.props && (d.props.model || d.props.product)) || '';
+      try {
+        const m = await cachedModel(d.serial);
+        model = (m && (m.friendly || m.model)) || model;
+      } catch (e) {}
+      return { serial: d.serial, model: model || d.serial };
+    }));
+    return {
+      ok: true,
+      autoconnect: !!config.autoconnect,
+      devices
+    };
+  });
+
+  ipcMain.handle('tray:set-autoconnect', async (_e, value) => {
+    config.autoconnect = !!value;
+    saveConfig();
+    if (win && !win.isDestroyed()) win.webContents.send('setting:changed', { key: 'autoconnect', value: config.autoconnect });
+    return { ok: true, autoconnect: config.autoconnect };
+  });
+
+  ipcMain.on('traymenu:show', () => {
+    showMainWindow();
+    try { if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); } catch (e) {}
+  });
+  ipcMain.on('traymenu:scan', () => {
+    sendMainTask({ kind: 'scan-request' });
+    try { if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); } catch (e) {}
+  });
+  ipcMain.on('traymenu:conn', () => {
+    sendMainTask({ kind: 'open-connect' });
+    try { if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); } catch (e) {}
+  });
+  ipcMain.on('traymenu:sett', () => {
+    sendMainTask({ kind: 'open-settings' });
+    try { if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.hide(); } catch (e) {}
+  });
   ipcMain.on('traymenu:exit', () => {
     quitting = true;
     // сначала мгновенно убираем окна и иконку из трея, чтобы «Выход»
@@ -3157,7 +4233,8 @@ const map = {
         const t = line.trim();
         if (!t) continue;
         if (t === 'emulated') { if (!roots.includes('/storage/emulated/0')) roots.push('/storage/emulated/0'); continue; }
-        if (t === 'self') continue;
+        if (t === 'self' || t === 'sdcard0' || t === 'sdcard') continue;
+        if (!/^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$/.test(t)) continue;
         const p = '/storage/' + t;
         if (!roots.includes(p)) roots.push(p);
       }
@@ -3171,21 +4248,66 @@ const map = {
     const rootsList = (Array.isArray(roots) && roots.length ? roots : await fsCatRoots(serial)).slice(0, 6);
     const items = [];
     const seen = new Set();
+    let truncated = false;
     for (const root of rootsList) {
       const pat = exts.map(e => '-iname "*.' + e + '"').join(' -o ');
       // -H: обходить симлинк /sdcard. 2>/dev/null: недоступные каталоги — норма, пропускаем.
-      const r = await adb.run(['-s', serial, 'shell', `find -H ${adb.shq(root)} -type f \\( ${pat} \\) 2>/dev/null | head -n 4000`], { timeout: 60000 });
+      const r = await adb.run(['-s', serial, 'shell', `find -H ${adb.shq(root)} -type f \\( ${pat} \\) 2>/dev/null | head -n 4001`], { timeout: 60000 });
       for (const line of (r.stdout || '').split(/\r?\n/)) {
         const p = line.trim();
         if (!p || p.length < 2 || seen.has(p)) continue;
         seen.add(p);
-        const name = p.split('/').pop();
-        items.push({ path: p, name, dir: false, size: 0, date: '' });
-        if (items.length >= 4000) break;
+        if (items.length < 4000) {
+          const name = p.split('/').pop();
+          items.push({ path: p, name, dir: false, size: 0, date: '' });
+        }
+        if (seen.size > 4000) { truncated = true; break; }
       }
-      if (items.length >= 4000) break;
+      if (truncated) break;
     }
-    return { ok: true, items, kind, roots: rootsList };
+    let total = seen.size;
+    if (truncated) {
+      let exact = 0, countOk = true;
+      for (const root of rootsList) {
+        try {
+          const pat = exts.map(e => '-iname "*.' + e + '"').join(' -o ');
+          const cr = await adb.run(['-s', serial, 'shell', `find -H ${adb.shq(root)} -type f \\( ${pat} \\) 2>/dev/null | wc -l`], { timeout: 60000 });
+          const m = String(cr.stdout || '').trim().match(/(\d+)\s*$/);
+          if (m) exact += Number(m[1]); else countOk = false;
+        } catch (e) { countOk = false; }
+      }
+      if (countOk) total = exact;
+    }
+    return { ok: true, items, total, kind, roots: rootsList };
+  });
+  // Количество файлов каждой категории — для подписей на кнопках «Все фото» и т.д.
+  // Считаем на телефоне (find | wc -l), не тянем сами пути: иначе это были бы мегабайты.
+  ipcMain.handle('fs:counts', async (_e, serial) => {
+    const rootsList = (await fsCatRoots(serial)).slice(0, 6);
+    const counts = {};
+    const extToKind = new Map();
+    for (const kind of Object.keys(CAT_KINDS)) {
+      counts[kind] = 0;
+      for (const e of CAT_KINDS[kind]) extToKind.set(String(e).toLowerCase(), kind);
+    }
+    const pat = [...extToKind.keys()].map(e => '-iname "*.' + e + '"').join(' -o ');
+    const seen = new Set();
+    for (const root of rootsList) {
+      try {
+      const r = await adb.run(['-s', serial, 'shell', `find -H ${adb.shq(root)} -type f \\( ${pat} \\) 2>/dev/null | head -n 4001`], { timeout: 60000 });
+        for (const line of (r.stdout || '').split(/\r?\n/)) {
+          const p = line.trim();
+          if (!p || seen.has(p)) continue;
+          const m = p.match(/\.([A-Za-z0-9]+)$/);
+          if (!m) continue;
+          const kind = extToKind.get(m[1].toLowerCase());
+          if (!kind) continue;
+          seen.add(p);
+          counts[kind]++;
+        }
+      } catch (e) {}
+    }
+    return { ok: true, counts, roots: rootsList };
   });
 
   /* ================= СОЗДАНИЕ ZIP-АРХИВА НА УСТРОЙСТВЕ (из файлов/папок) ================= */
@@ -4278,11 +5400,13 @@ app.whenReady().then(async () => {
           config[k] = v; saveConfig();
           if (k === 'agentEnabled') agentMcp.setEnabled(!!v);
           if (k === 'adbPath') adb.setAdbPath(v);
+          try { if (win && !win.isDestroyed()) win.webContents.send('setting:changed', { key: k, value: v }); } catch (e) { logErr('setSetting', k, e.message); }
           return { ok: true };
         },
         // безопасные внутренние функции (режим 2)
         callFns: {
           adbDevices: async () => adb.devices(),
+          devDetect: async () => (devDetectFn ? devDetectFn() : { ok: false, error: 'Обнаружение недоступно' }),
           adbConnect: async ({ host, port }) => connectDevice(host, +port),
           adbDisconnect: async ({ serial }) => adb.disconnect(serial),
           adbPing: async ({ serial }) => { try { return await adb.pingDevice(serial); } catch (e) { return { ok: false }; } },
@@ -4300,10 +5424,16 @@ app.whenReady().then(async () => {
         // тот же механизм, что у кнопок UI (см. apps:action выше) — включая
         // обход «Cannot disable system packages» через pm uninstall -k --user 0.
         const runA = (cmd) => adb.run(['-s', serial, 'shell', cmd], { timeout: 30000 });
+        if (action === 'phoneInfo') {
+          const r = await adb.run(['-s', serial, 'shell', 'am', 'start',
+            '-a', 'android.settings.APPLICATION_DETAILS_SETTINGS',
+            '-d', 'package:' + pkg], { timeout: 20000 });
+          return { ok: r.ok, message: ((r.stdout || '') + ' ' + (r.stderr || '')).trim().slice(0, 300) };
+        }
         let cmd = action === 'forceStop' ? 'am force-stop ' + adb.shq(pkg)
           : action === 'disable' ? 'pm disable-user --user 0 ' + adb.shq(pkg)
           : action === 'enable' ? 'pm enable ' + adb.shq(pkg)
-          : action === 'clearCache' ? 'pm clear ' + adb.shq(pkg)
+          : action === 'clear' || action === 'clearCache' ? 'pm clear ' + adb.shq(pkg)
           : action === 'restore' ? 'cmd package install-existing --user 0 ' + adb.shq(pkg)
           : action === 'uninstall' ? 'pm uninstall --user 0 ' + adb.shq(pkg)
           : null;
@@ -4429,6 +5559,45 @@ app.whenReady().then(async () => {
           },
           // снимок экрана ТЕЛЕФОНА (PNG в папку «Сохранения\Агент»)
           deviceScreenState: async ({ serial }) => screenStateOf(serial),
+          deviceUi: async ({ serial }) => {
+            if (!serial) return { ok: false, error: 'Нет активного устройства' };
+            const remote = '/sdcard/.adbwifi-ui.xml';
+            const dump = await adb.run(['-s', serial, 'shell', 'uiautomator', 'dump', remote], { timeout: 25000 });
+            const cat = await adb.run(['-s', serial, 'shell', 'cat', remote], { timeout: 25000 });
+            adb.run(['-s', serial, 'shell', 'rm', '-f', remote], { timeout: 5000 }).catch(() => {});
+            if (!cat.ok || !cat.stdout || !cat.stdout.trim()) {
+              return {
+                ok: false,
+                error: ((dump.stderr || dump.stdout || cat.stderr || cat.stdout || 'uiautomator dump не вернул XML').trim()).slice(0, 500)
+              };
+            }
+            const decode = (s) => String(s || '')
+              .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+              .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+            const nodes = [];
+            const nodeRe = /<node\b([^>]*?)\/?>/g;
+            let match;
+            while ((match = nodeRe.exec(cat.stdout)) && nodes.length < 600) {
+              const attrs = {};
+              const attrRe = /([\w:-]+)="([^"]*)"/g;
+              let attr;
+              while ((attr = attrRe.exec(match[1]))) attrs[attr[1]] = attr[2];
+              nodes.push({
+                text: decode(attrs.text),
+                desc: decode(attrs['content-desc']),
+                id: attrs['resource-id'] || '',
+                cls: attrs.class || '',
+                package: attrs.package || '',
+                bounds: attrs.bounds || '',
+                clickable: attrs.clickable === 'true',
+                enabled: attrs.enabled !== 'false',
+                selected: attrs.selected === 'true',
+                checked: attrs.checked === 'true',
+                focused: attrs.focused === 'true'
+              });
+            }
+            return { ok: true, count: nodes.length, nodes, xml: cat.stdout.slice(0, 300000) };
+          },
           deviceScreenshot: async ({ serial }) => {
             let screen = await screenStateOf(serial);
             if (screen.screenOn === false) {
@@ -4576,13 +5745,28 @@ if (config.assocOn) setTimeout(() => { assocStartupRepair().catch(() => {}); }, 
   });
   app.on('window-all-closed', () => { if (miniOnly || !config.closeToTray) app.quit(); });
   app.on('before-quit', (e) => {
+    if (recordChild && !recordQuitClosing) {
+      e.preventDefault();
+      recordQuitClosing = true;
+      quitting = true;
+      const child = recordChild, meta = recordMeta;
+      (async () => {
+        let closed = false;
+        try { closed = await closeScrcpyWindow(child.pid, meta && meta.hwnd); } catch (err) {}
+        if (closed) await waitChildClose(child, 6000);
+        if (recordChild === child) { try { child.kill('SIGKILL'); } catch (err) {} }
+        app.quit();
+      })();
+      return;
+    }
     quitting = true;
+    try { if (trayMenuWin && !trayMenuWin.isDestroyed()) trayMenuWin.destroy(); } catch (err) {}
+    trayMenuWin = null;
+    try { if (tray) tray.destroy(); } catch (err) {}
+    tray = null;
     // W4-ревизор: запись экрана добиваем СИГНАЛОМ НА УСТРОЙСТВЕ (SIGINT device-side):
     // device-screenrecord финализирует mp4-контейнер — файл остаётся играбельным,
     // и владелец найдёт его в Movies/ADB-WiFi-Connector (просто закрыл программу во время записи)
-    if (recordChild && recordMeta) {
-      try { adb.runSync(['-s', recordMeta.serial, 'shell', 'kill -2 $(pidof screenrecord) 2>/dev/null'], 1500); } catch (err) {}
-    }
     // гасим ВСЕ свои дочерние процессы (A2-ревью: mirror/shell/install раньше переживали выход)
     stopMirrorAll();
     try { clipStop(true); } catch (e) {}
@@ -4590,6 +5774,9 @@ if (config.assocOn) setTimeout(() => { assocStartupRepair().catch(() => {}); }, 
     try { if (installChild) installChild.kill('SIGKILL'); } catch (e) {}
     try { if (logcatChild) logcatChild.kill('SIGKILL'); } catch (e) {}
     try { if (recordChild) recordChild.kill('SIGKILL'); } catch (e) {}
+    try { if (cameraProc) cameraProc.kill('SIGKILL'); } catch (e) {}
+    try { if (audioProc) audioProc.kill('SIGKILL'); } catch (e) {}
+    try { execFile('taskkill', ['/F', '/IM', 'PhoneVirtualCam.exe'], { windowsHide: true }, () => {}); } catch (e) {}
     try { qrpair.cancel(); } catch (e) {}
     // не ждём adb kill-server (раньше runSync мог держать выход до 6 с)
     killAdbServerSoon();

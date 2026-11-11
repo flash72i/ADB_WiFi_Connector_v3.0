@@ -48,6 +48,25 @@ contextBridge.exposeInMainWorld('api', {
   toolLogcatStop: invoke('tools:logcat-stop'),
   toolLogcatClear: invoke('tools:logcat-clear'),
   toolScrcpy: invoke('tools:scrcpy'),
+  cameraStart: invoke('camera:start'),
+  cameraStop: invoke('camera:stop'),
+  cameraStatus: invoke('camera:status'),
+  cameraInstall: invoke('camera:install'),
+  cameraSavePhoto: invoke('camera:save-photo'),
+  cameraSaveVideo: invoke('camera:save-video'),
+  cameraOpenCaptures: invoke('camera:open-captures'),
+  driversStatus: invoke('drivers:status'),
+  driversInstallAudio: invoke('drivers:install-audio'),
+  driversOpenAudio: invoke('drivers:open-audio'),
+  driversUninstallAudio: invoke('drivers:uninstall-audio'),
+  audioStart: invoke('audio:start'),
+  audioStop: invoke('audio:stop'),
+  audioStatus: invoke('audio:status'),
+  audioOpenRecordings: invoke('audio:open-recordings'),
+  systemMics: invoke('audio:system-mics'),
+  systemMicSet: invoke('audio:set-default-mic'),
+  systemMicRename: invoke('audio:rename-mic'),
+  openSoundSettings: invoke('audio:open-sound-settings'),
   toolInstallApk: invoke('tools:install-apk'),
   toolInstallApkCancel: invoke('tools:install-apk-cancel'),
   toolQuick: invoke('tools:quick'),
@@ -131,12 +150,20 @@ contextBridge.exposeInMainWorld('api', {
   fsTmpWrite: invoke('fs:tmp-write'),       // Р±Р°Р№С‚С‹ в†’ РІСЂРµРјРµРЅРЅС‹Р№ Р»РѕРєР°Р»СЊРЅС‹Р№ С„Р°Р№Р» (HTML-РїСЂРµРІСЊСЋ)
   fsExtract: invoke('fs:extract'),          // СЂР°СЃРїР°РєРѕРІРєР° Р°СЂС…РёРІР° РІ РїР°РїРєСѓ СЃ РёРјРµРЅРµРј Р°СЂС…РёРІР° (СЃРІРѕР№СЃС‚РІР° С„Р°Р№Р»Р°)
   shellOpenPath: invoke('shell:open-path'), // РѕС‚РєСЂС‹С‚СЊ Р»РѕРєР°Р»СЊРЅС‹Р№ С„Р°Р№Р» СЃРёСЃС‚РµРјРЅРѕР№ РїСЂРѕРіСЂР°РјРјРѕР№
-  usbRestart: invoke('usb:restart'),        // РїРµСЂРµР·Р°РіСЂСѓР·РєР° USB-РїРѕСЂС‚Р° (Р·Р°РІРёСЃС€РёР№ С‚РµР»РµС„РѕРЅ)
+  usbRestart: invoke('usb:restart'),
+  usbOpenMtp: invoke('usb:open-mtp'),       // открыть MTP-файлы USB-устройства в Проводнике
+  usbPnp: invoke('usb:pnp'),                // список USB MTP-устройств для файлового менеджера
+  mtpList: invoke('mtp:list'),              // содержимое MTP-папки (Android без ADB)
+  mtpOpenFile: invoke('mtp:open'),          // скачать MTP-файл во временную папку и открыть
+  mtpSaveFile: invoke('mtp:save'),          // сохранить MTP-файл на компьютер
+  mtpDelete: invoke('mtp:delete'),          // удалить файл на MTP-устройстве
+  mtpUpload: invoke('mtp:push'),            // загрузить файл с компьютера в MTP-папку        // РїРµСЂРµР·Р°РіСЂСѓР·РєР° USB-РїРѕСЂС‚Р° (Р·Р°РІРёСЃС€РёР№ С‚РµР»РµС„РѕРЅ)
   // С„Р°Р№Р»РѕРІС‹Р№ РјРµРЅРµРґР¶РµСЂ вЂ” Р°СЂС…РёРІС‹, РєР°С‚РµРіРѕСЂРёРё, DOCX, USB-РёРЅСЃС‚СЂСѓРјРµРЅС‚С‹
   fsZipCreate: invoke('fs:zipcreate'),      // СЃРѕР±СЂР°С‚СЊ ZIP РёР· С„Р°Р№Р»РѕРІ/РїР°РїРѕРє СѓСЃС‚СЂРѕР№СЃС‚РІР°
   fsZipList: invoke('fs:ziplist'),          // СЃРѕРґРµСЂР¶РёРјРѕРµ ZIP-Р°СЂС…РёРІР° Р±РµР· СЂР°СЃРїР°РєРѕРІРєРё
   fsZipRead: invoke('fs:zipread'),          // РїСЂРѕС‡РёС‚Р°С‚СЊ С„Р°Р№Р» РР— Р°СЂС…РёРІР° (Р±Р°Р№С‚С‹)
-  fsSearch: invoke('fs:search'),            // РєР°С‚РµРіРѕСЂРёРё: РІСЃРµ С„РѕС‚Рѕ/РјСѓР·С‹РєР°/РІРёРґРµРѕ/РґРѕРєСѓРјРµРЅС‚С‹
+  fsSearch: invoke('fs:search'),
+  fsCounts: invoke('fs:counts'),            // РєР°С‚РµРіРѕСЂРёРё: РІСЃРµ С„РѕС‚Рѕ/РјСѓР·С‹РєР°/РІРёРґРµРѕ/РґРѕРєСѓРјРµРЅС‚С‹
   fsDocx: invoke('fs:docx'),                // DOCX в†’ HTML РґР»СЏ РїСЂРѕСЃРјРѕС‚СЂР°
   apkInstalledInfo: invoke('apk:installedinfo'), // СѓСЃС‚Р°РЅРѕРІР»РµРЅР° Р»Рё РІРµСЂСЃРёСЏ РїР°РєРµС‚Р° РЅР° С‚РµР»РµС„РѕРЅРµ
   apkPhoneInstall: invoke('apk:phoneinstall'),   // СѓСЃС‚Р°РЅРѕРІРёС‚СЊ APK, РєРѕС‚РѕСЂС‹Р№ СѓР¶Рµ Р»РµР¶РёС‚ РЅР° С‚РµР»РµС„РѕРЅРµ
@@ -150,7 +177,10 @@ contextBridge.exposeInMainWorld('api', {
   usbFakeTestCancel: invoke('usb:faketest-cancel'),
   miniClose: () => ipcRenderer.send('mini:close'), // Р·Р°РєСЂС‹С‚СЊ РјРёРЅРё-РѕРєРЅРѕ APK (window.close Р·Р°РїСЂРµС‰С‘РЅ РІ sandbox)
   miniOpenMain: () => ipcRenderer.send('mini:open-main'), // РѕС‚РєСЂС‹С‚СЊ РѕСЃРЅРѕРІРЅСѓСЋ РїСЂРѕРіСЂР°РјРјСѓ РёР· СѓСЃС‚Р°РЅРѕРІС‰РёРєР°
-  trayMenu: (m) => ipcRenderer.send('traymenu:' + m), // СЃРѕР±СЃС‚РІРµРЅРЅРѕРµ С‚СЂРµР№-РјРµРЅСЋ
+  trayMenu: (m) => ipcRenderer.send('traymenu:' + m),
+  trayState: invoke('tray:state'),
+  traySetAutoconnect: invoke('tray:set-autoconnect'),
+  onSettingChanged: (cb) => ipcRenderer.on('setting:changed', (_e, data) => cb(data)),
   apkLocalMeta: invoke('apk:localmeta'),    // РёРєРѕРЅРєР°/РёРјСЏ/РїР°РєРµС‚/РІРµСЂСЃРёСЏ Р»РѕРєР°Р»СЊРЅРѕРіРѕ APK
   apkMakeShortcut: invoke('apk:make-shortcut'), // СЏСЂР»С‹Рє РЅР° СЂР°Р±РѕС‡РµРј СЃС‚РѕР»Рµ СЃ РёРєРѕРЅРєРѕР№ РїСЂРёР»РѕР¶РµРЅРёСЏ
   apkRemoteMeta: invoke('apk:remotemeta'),  // РёРєРѕРЅРєР°/РёРјСЏ APK-С„Р°Р№Р»Р°, Р»РµР¶Р°С‰РµРіРѕ РќРђ РўР•Р›Р•Р¤РћРќР•

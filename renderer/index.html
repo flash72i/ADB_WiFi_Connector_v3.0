@@ -17,8 +17,10 @@
   </div>
   <!-- глобальное активное устройство — видно на всех страницах (R7/R8) -->
   <!-- значок типа подключения (Wi-Fi / USB) прямо в шапке -->
+  <div class="tb-center">
   <span id="tb-conn-ico" class="conn-ico" aria-hidden="true"></span>
   <select id="tb-device" data-tip="Активное устройство" autocomplete="off"></select>
+  </div>
   <div class="tb-buttons">
     <button class="tb-btn" id="btn-min" data-tip="Свернуть">&#x2500;</button>
     <button class="tb-btn" id="btn-max" data-tip="Развернуть">&#x25A1;</button>
@@ -35,6 +37,8 @@
     <button class="rail-item" data-page="files"><span class="rail-ico">&#128193;</span><span>Файлы</span></button>
     <button class="rail-item" data-page="apps"><span class="rail-ico">&#128230;</span><span>Приложения</span></button>
     <button class="rail-item" data-page="apk"><span class="rail-ico">&#128242;</span><span>Установка APK</span></button>
+    <button class="rail-item" data-page="camera"><span class="rail-ico">&#128247;</span><span>Веб-камера</span></button>
+    <button class="rail-item" data-page="mic"><span class="rail-ico">&#127908;</span><span>Микрофон</span></button>
     <button class="rail-item" data-page="settings"><span class="rail-ico">&#9881;</span><span>Настройки</span></button>
     <div class="rail-spacer"></div>
     <!-- мини-плеер всегда на виду ПОД разделом и НАД полоской статуса; пока музыки нет — неактивен -->
@@ -65,8 +69,11 @@
         </div>
       </div>
     </div>
-    <div class="rail-status" id="adb-status" data-tip="Состояние adb">&#8230;</div>
-    <div class="rail-author" data-tip="Автор программы">Автор: Рэйф_72</div>
+    <div class="rail-status" id="adb-status">&#8230;</div>
+    <div class="rail-bottom-row">
+      <div class="rail-author" data-tip="Автор программы">Автор: Рэйф_72</div>
+      <button class="rail-theme" id="btn-theme-toggle" type="button" title="Переключить тему"><span id="theme-icon">☾</span></button>
+    </div>
   </nav>
 
   <main id="content">
@@ -77,6 +84,7 @@
         <h1>Подключение</h1>
         <button class="btn btn-text" id="btn-usb-restart" data-tip="Найти USB-устройство телефона и перезагрузить порт, не отключая кабель. Помогает, когда телефон завис и перестал определяться. Windows запросит права администратора.">Перезагрузить USB-порт</button>
         <button class="btn btn-text" id="btn-help">Как подключить?</button>
+        <label class="mic-check dev-auto" title="Автоматически выбирать единственное доступное устройство. При нескольких устройствах выберите нужное вручную."><input type="checkbox" id="dev-autoconnect"><span>Автоподключение</span></label>
       </div>
 
       <div class="banner hidden" id="adb-banner">
@@ -87,6 +95,7 @@
       <div class="card active-device hidden" id="active-card">
         <div class="grow">
           <div class="ad-name"><span class="dot"></span><span id="ad-name">—</span>
+            <button class="star hidden" id="ad-fav" data-tip="В избранное">&#9734;</button>
             <span class="st-chip st-active" id="ad-chip">активно</span></div>
           <div class="ad-serial" id="ad-serial" data-tip="Нажмите, чтобы скопировать"></div>
           <div class="ad-chips" id="ad-chips"></div>
@@ -127,14 +136,14 @@
           </div>
           <div class="row" style="margin-top:10px">
             <button class="btn btn-filled" id="btn-connect">Подключить</button>
-            <button class="btn btn-tonal" id="btn-scan">Сканировать сеть</button>
+            <button class="btn btn-tonal" id="btn-scan" data-tip="Ищет устройства в локальной сети и подключённые по USB (MTP/WPD), даже если отладка выключена">Сканировать устройства</button>
           </div>
         </div>
 
         <!-- (б) беспроводное сопряжение: код + QR на одной карточке (R1/R2/R4/R6) -->
         <div class="card" id="pair-card">
           <h3>&#128274; Беспроводное сопряжение <span class="muted small">(Android 11+, первый раз)</span></h3>
-          <p class="muted small">На телефоне: «Параметры разработчика» → «Беспроводная отладка» →
+          <p class="muted small">Отправитье: «Параметры разработчика» → «Беспроводная отладка» →
           «Сопряжение устройства по коду». Введите показанные адрес и код — или нажмите «QR-код на телефон»:
           код появится сразу под кнопкой, наведите камеру телефона.</p>
           <div class="row">
@@ -178,7 +187,7 @@
 
       <div class="card hidden" id="scan-card">
         <div class="row between">
-          <b id="scan-title">Сканирование локальной сети…</b>
+          <b id="scan-title">Поиск устройств (сеть + USB)…</b>
           <span id="scan-progress-text"></span>
         </div>
         <div id="scan-progress"><div class="progress"><div class="progress-bar" id="scan-bar"></div></div></div>
@@ -195,7 +204,7 @@
         <div class="dev-group">
           <h2 class="section-title" style="margin:14px 0 8px">Избранное</h2>
           <div id="fav-list" class="cards"></div>
-          <div class="empty hidden" id="fav-empty">Пусто. Добавьте устройство звёздочкой — оно будет подключаться при запуске, если включить это в настройках.</div>
+          <div class="empty hidden" id="fav-empty">Пусто. Нажмите ☆ у устройства — в верхней карточке, в списке или истории. Автоподключение включается в «Настройках» → «Поведение при запуске».</div>
         </div>
         <div class="dev-group wide">
           <div class="row between"><h2 class="section-title" style="margin:14px 0 8px">История</h2><button class="btn btn-text" id="btn-hist-clear">Очистить</button></div>
@@ -230,7 +239,7 @@
         </div>
 
         <div class="card tool-card">
-          <h3>&#127909; Запись экрана</h3>
+          <h3>&#127909; Запись экрана <span class="muted small">(со звуком телефона)</span></h3>
           <p class="muted">Видео с экрана (до 3 минут), сохраняется в MP4.</p>
           <div class="row">
             <button class="btn btn-tonal btn-sm" id="btn-record-start">Начать запись</button>
@@ -385,7 +394,22 @@
         </div>
       </div>
       <div class="muted small" id="fs-crumb" style="margin:-8px 0 8px"></div>
-      <div class="card">
+      <div class="card hidden" id="mtp-inline">
+        <div class="row between">
+          <b id="mtp-inline-device">—</b>
+          <span class="muted small">USB MTP · без ADB</span>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn-tonal btn-sm" id="mtp-inline-up">&#8592; Вверх</button>
+          <button class="btn btn-tonal btn-sm" id="mtp-inline-refresh">&#8635; Обновить</button>
+          <button class="btn btn-tonal btn-sm" id="mtp-inline-upload">&#11014; Загрузить с ПК</button>
+          <span class="grow"></span>
+          <span class="mono small" id="mtp-inline-path">/</span>
+        </div>
+        <div id="mtp-inline-list" class="list" style="margin-top:10px"></div>
+        <div class="muted small" id="mtp-inline-status" style="margin-top:6px"></div>
+      </div>
+      <div class="card" id="fs-card">
         <!-- панель инструментов ЗАКРЕПЛЕНА: при прокрутке списка адрес, папки и кнопки остаются наверху -->
         <div class="fs-sticky">
         <div class="row">
@@ -431,7 +455,7 @@
           <button class="btn btn-tonal btn-sm" id="btn-fs-batch-get" data-tip="Скачать отмеченные файлы на компьютер">Скачать</button>
           <button class="btn btn-tonal btn-sm" id="btn-fs-batch-copy" data-tip="Скопировать отмеченные в буфер обмена">Копировать</button>
           <button class="btn btn-tonal btn-sm" id="btn-fs-batch-cut" data-tip="Вырезать отмеченные в буфер обмена">Вырезать</button>
-          <button class="btn btn-tonal btn-sm" id="btn-fs-batch-phone" data-tip="Передать отмеченные файлы на другой подключённый телефон напрямую по Wi-Fi">На телефон</button>
+          <button class="btn btn-tonal btn-sm" id="btn-fs-batch-phone" data-tip="Передать отмеченные файлы на другое подключённое устройство напрямую по Wi-Fi">Отправить</button>
           <button class="btn btn-text btn-sm" id="btn-fs-batch-del" data-tip="Удалить отмеченные с телефона">Удалить</button>
           <button class="btn btn-text btn-sm" id="btn-fs-batch-clear">Снять</button>
         </div>
@@ -521,6 +545,158 @@
       </div>
     </section>
 
+    <!-- ================= СТРАНИЦА: КАМЕРА ================= -->
+    <section class="page" id="page-camera">
+      <div class="page-head camera-head">
+        <h1>Камера телефона</h1>
+        <div class="hint" id="cam-hint">Поток с телефона по ADB. Для виртуальной камеры Windows телефон должен быть подключён к этому компьютеру.</div>
+      </div>
+      <div class="card camera-card">
+        <div class="camera-stage" id="cam-stage">
+          <img id="cam-stream" alt="Поток с камеры телефона" crossorigin="anonymous">
+          <div class="camera-placeholder" id="cam-placeholder">
+            <div class="camera-placeholder-icon">&#128247;</div>
+            <div>Камера выключена</div>
+            <div class="muted">Нажмите «Запустить камеру»</div>
+          </div>
+          <div class="camera-badge" id="cam-badge">выключено</div>
+        </div>
+        <div class="camera-controls">
+          <div class="camera-row">
+            <button class="btn primary" id="cam-start">Запустить камеру</button>
+            <button class="btn" id="cam-stop">Остановить</button>
+            <button class="btn" id="cam-install" title="Установите приложение для использования функций камеры">Установить приложение</button>
+            <span class="camera-status" id="cam-status">—</span>
+          </div>
+          <div class="camera-row">
+            <div class="seg-control" role="group" aria-label="Выбор камеры">
+              <button type="button" class="seg-item" data-cam="0">Задняя</button>
+              <button type="button" class="seg-item" data-cam="1">Передняя</button>
+              <button type="button" class="seg-item" id="cam-auto">Авто</button>
+            </div>
+            <span class="camera-sep"></span>
+            <button class="btn" data-cam-rotate="-90">Влево 90</button>
+            <button class="btn" data-cam-rotate="90">Вправо 90</button>
+            <button class="btn" data-cam-rotate="180">180°</button>
+            <button class="btn" id="cam-mirror">Зеркало</button>
+            <button class="btn" id="cam-reset">Сброс</button>
+          </div>
+          <div class="camera-row camera-zoom-row">
+            <label class="camera-zoom-label" for="cam-zoom">Зум</label>
+            <input type="range" id="cam-zoom" min="0.6" max="8" step="0.1" value="1">
+            <span class="camera-zoom-value" id="cam-zoom-value">1.0×</span>
+            <label class="camera-mode-label">Формат
+              <select id="cam-resolution" class="input-sm">
+                <option value="1280x720">720p</option>
+                <option value="1920x1080">1080p</option>
+                <option value="3840x2160">4K</option>
+              </select>
+            </label>
+            <label class="camera-mode-label">Кадры
+              <select id="cam-fps" class="input-sm">
+                <option value="30">30 FPS</option>
+                <option value="60" selected>60 FPS</option>
+              </select>
+            </label>
+          </div>
+          <div class="camera-row camera-capture-row">
+            <button class="btn" id="cam-shot" disabled>Снимок</button>
+            <button class="btn" id="cam-record" title="Записать видео в MP4" disabled>Запись MP4</button>
+            <button class="btn btn-sm" id="cam-open-captures">Папка</button>
+            <span class="camera-capture-note" id="cam-capture-note"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= СТРАНИЦА: МИКРОФОН ================= -->
+    <section class="page" id="page-mic">
+      <div class="page-head">
+        <h1>Микрофон</h1>
+        <span class="mic-brand">ADB Android</span>
+      </div>
+
+      <div class="card mic-card">
+        <div class="mic-head">
+          <div>
+            <h3>ADB Android — Микрофон</h3>
+            <p class="muted small">Звук с телефона в реальном времени.</p>
+          </div>
+          <div class="mic-live"><span class="mic-dot" id="mic-dot"></span><span id="mic-live-text">не подключён</span></div>
+        </div>
+
+        <div class="mic-viz-bar">
+          <span class="mic-viz-label">Визуализация</span>
+          <div class="seg-control" id="mic-viz-switch" role="group" aria-label="Визуализация звука">
+            <button type="button" class="seg-item" data-viz="rings">Кольца</button>
+            <button type="button" class="seg-item" data-viz="pulse">Пульс</button>
+            <button type="button" class="seg-item" data-viz="space">Космос</button>
+            <button type="button" class="seg-item" data-viz="bars">Полосы</button>
+          </div>
+        </div>
+
+        <div class="mic-wave-box">
+          <canvas id="mic-wave"></canvas>
+          <div class="mic-wave-idle" id="mic-wave-idle">Нажми «Старт» и говори в телефон</div>
+        </div>
+
+        <div class="mic-levels">
+          <div class="mic-level"><span>L</span><div class="mic-level-track"><i id="mic-level-l"></i></div></div>
+          <div class="mic-level"><span>R</span><div class="mic-level-track"><i id="mic-level-r"></i></div></div>
+        </div>
+
+        <div class="mic-controls">
+          <button class="mic-action primary" id="mic-start"><span>&#9654;</span> Старт</button>
+          <button class="mic-action" id="mic-stop" disabled><span>&#9632;</span> Стоп</button>
+          <label class="mic-check"><input type="checkbox" id="mic-listen"><span>Слышать в динамиках</span></label>
+          <label class="mic-check"><input type="checkbox" id="mic-autostart"><span>Автозапуск</span></label>
+          <label class="mic-device"><span>Динамики</span><select id="mic-device"></select></label>
+          <button class="mic-action record" id="mic-record"><span>&#9679;</span> Записать</button>
+          <button class="mic-action" id="mic-open-rec">Папка записей</button>
+        </div>
+
+        <div class="mic-footer">
+          <span id="mic-status">Готов</span>
+          <span id="mic-timer"></span>
+          <span id="mic-saved" class="muted small"></span>
+        </div>
+
+      </div>
+
+      <div class="card sysmic-card">
+        <div class="sysmic-head">
+          <div>
+            <h3>Системный микрофон Windows</h3>
+            <p class="muted small">Выберите <b>CABLE Output (VB-Audio Virtual Cable)</b> — это микрофон телефона. Он будет использоваться программами по умолчанию.</p>
+          </div>
+          <span class="sysmic-badge" id="mic-system-badge">проверка…</span>
+        </div>
+        <div class="sysmic-current"><span>Сейчас в системе</span><b id="mic-system-current">…</b></div>
+        <div class="sysmic-row">
+          <select id="mic-system-select" class="sysmic-select"></select>
+          <button class="btn" id="mic-system-refresh">Обновить</button>
+          <button class="btn primary" id="mic-system-apply">Сделать по умолчанию</button>
+          <button class="btn" id="mic-system-sound">Звуковые настройки</button>
+        </div>
+        <div class="muted small" id="mic-system-status"></div>
+      </div>
+
+      <div class="card driver-card">
+        <h3>VB-CABLE — виртуальный микрофон</h3>
+        <p class="muted small">Драйвер создаёт устройство <b>CABLE Output</b>. После установки выберите его в системном микрофоне выше.</p>
+        <div class="driver-row">
+          <span class="driver-dot" id="drv-audio-dot"></span>
+          <span id="drv-audio-status">Проверка…</span>
+          <button class="btn btn-sm" id="drv-audio-refresh">Обновить</button>
+        </div>
+        <div class="camera-row" style="margin-top:10px">
+          <button class="btn primary" id="drv-audio-install">Установить VB-CABLE</button>
+          <button class="btn" id="drv-audio-uninstall">Удалить драйвер</button>
+        </div>
+        <div class="muted small" id="drv-audio-note" style="margin-top:8px">Установщик запускается отдельно и требует подтверждения администратора.</div>
+      </div>
+    </section>
+
     <!-- ================= СТРАНИЦА: НАСТРОЙКИ ================= -->
     <section class="page" id="page-settings">
       <div class="page-head"><h1>Настройки</h1></div>
@@ -528,7 +704,7 @@
       <div class="card">
         <h3>Поведение при запуске</h3>
         <label class="switch-row"><span>Запускать вместе с Windows</span><label class="switch"><input type="checkbox" id="set-autostart"><span class="slider"></span></label></label>
-        <label class="switch-row"><span>Сворачивать в трей при закрытии</span><label class="switch"><input type="checkbox" id="set-tray"><span class="slider"></span></label></label>
+        <label class="switch-row"><span>При закрытии крестиком</span><select id="set-close-mode" class="input-sm"><option value="quit">Закрывать программу полностью</option><option value="tray">Сворачивать в трей</option></select></label>
         <label class="switch-row" data-tip="По умолчанию выключено: приложение НЕ подключается к устройствам само, пока вы не включите этот пункт">
           <span>Подключаться к последнему устройству при запуске <em class="muted small">(по умолчанию выключено)</em></span>
           <label class="switch"><input type="checkbox" id="set-autolast"><span class="slider"></span></label></label>
@@ -590,6 +766,7 @@
         <div class="row" style="margin-top:8px">
           <button class="btn btn-filled btn-sm" id="btn-agent-stop" data-tip="Аварийная остановка текущей серии действий агента">■ Аварийно остановить агента</button>
           <button class="btn btn-text btn-sm" id="btn-agent-reset" data-tip="Сбросить флаг остановки — агент снова сможет выполнять действия">Сбросить остановку</button>
+          <button class="btn btn-tonal btn-sm" id="btn-agent-help" data-tip="Краткая инструкция и готовый текст для другого ИИ-агента">Инструкция</button>
         </div>
       </div>
     </section>
@@ -601,7 +778,7 @@
   <div class="dialog">
     <div class="dialog-head"><h2>Как подключить</h2><button class="dlg-x" data-close="dlg-help">&#x2715;</button></div>
     <ol class="help-list">
-      <li>На телефоне включите «Параметры разработчика» → «Беспроводная отладка».</li>
+      <li>Отправитье включите «Параметры разработчика» → «Беспроводная отладка».</li>
       <li>Первый раз: нажмите «QR-код на телефон» — и отсканируйте код камерой телефона
       (на телефоне: «Беспроводная отладка» → «Подключить устройство по QR-коду»); всё произойдёт автоматически.</li>
       <li>Либо на экране «Сопряжение устройства по коду» введите адрес и код в карточке «Беспроводное сопряжение».</li>
@@ -609,6 +786,20 @@
       <li>Телефон и компьютер должны быть в одной сети Wi-Fi; сеть Windows — «Частная».</li>
     </ol>
     <div class="dialog-foot"><button class="btn btn-filled" data-close="dlg-help">Понятно</button></div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="dlg-agent-help">
+  <div class="dialog" style="width:780px;max-width:94vw">
+    <div class="dialog-head"><h2>Инструкция для ИИ-агента</h2><button class="dlg-x" data-close="dlg-agent-help">&#x2715;</button></div>
+    <div class="dialog-body">
+      <p class="muted small">Скопируйте текст и вставьте его другому агенту. Он сам подключится к MCP и выполнит задачу с телефоном.</p>
+      <pre id="agent-help-text" class="mono" style="white-space:pre-wrap;line-height:1.5;background:#0b1118;border:1px solid #263340;border-radius:8px;padding:12px;max-height:52vh;overflow:auto;font-size:12px"></pre>
+    </div>
+    <div class="dialog-foot">
+      <button class="btn btn-filled" id="btn-agent-help-copy">Скопировать инструкцию</button>
+      <button class="btn btn-text" data-close="dlg-agent-help">Закрыть</button>
+    </div>
   </div>
 </div>
 
@@ -708,7 +899,7 @@
 <!-- ===== передача файлов на другой телефон напрямую по Wi-Fi ===== -->
 <div class="overlay hidden" id="dlg-phonetransfer">
   <div class="dialog" style="width:560px">
-    <div class="dialog-head"><h2>Передача на другой телефон</h2><button class="dlg-x" data-close="dlg-phonetransfer">&#x2715;</button></div>
+    <div class="dialog-head"><h2>Отправить на другое устройство</h2><button class="dlg-x" data-close="dlg-phonetransfer">&#x2715;</button></div>
     <div class="muted small" id="pt-sub" style="margin:-2px 0 8px"></div>
     <div class="row" style="gap:10px;align-items:center;margin:8px 0">
       <label class="muted small" for="pt-target">Получатель</label>
@@ -717,17 +908,34 @@
     <div class="row" style="gap:10px;align-items:center;margin:8px 0">
       <label class="muted small" for="pt-dest">Папка</label>
       <input id="pt-dest" class="input-sm grow" value="/sdcard/Download" spellcheck="false">
+      <button class="btn btn-text btn-sm" id="btn-pt-browse">Выбрать…</button>
     </div>
     <div class="muted small" id="pt-files" style="margin:8px 0;line-height:1.55"></div>
+    <div class="pt-progress-wrap">
+      <div class="pt-progress"><div class="pt-progress-bar" id="pt-progress-bar"></div></div>
+      <span class="pt-progress-label" id="pt-progress-label">0%</span>
+    </div>
     <div class="muted small" id="pt-status" style="margin:8px 0;line-height:1.55"></div>
     <div class="dialog-foot">
-      <button class="btn btn-tonal btn-sm" id="btn-pt-start">Передать</button>
+      <button class="btn btn-tonal btn-sm" id="btn-pt-start">Отправить</button>
       <button class="btn btn-text" data-close="dlg-phonetransfer">Отмена</button>
     </div>
   </div>
 </div>
 
 <!-- ===== история буфера обмена телефона ===== -->
+<div class="overlay hidden" id="dlg-conflict">
+  <div class="dialog" style="width:520px">
+    <div class="dialog-head"><h2>Файлы уже есть</h2></div>
+    <p class="muted small" id="conflict-body"></p>
+    <div class="dialog-foot">
+      <button class="btn btn-tonal btn-sm" id="btn-conflict-replace">Заменить</button>
+      <button class="btn btn-filled btn-sm" id="btn-conflict-rename">Переименовать новые</button>
+      <button class="btn btn-text btn-sm" id="btn-conflict-cancel">Отмена</button>
+    </div>
+  </div>
+</div>
+
 <div class="overlay hidden" id="dlg-clipboard">
   <div class="dialog" style="width:640px">
     <div class="dialog-head"><h2>&#128203; Буфер обмена телефона</h2><button class="dlg-x" data-close="dlg-clipboard">&#x2715;</button></div>
@@ -819,6 +1027,13 @@
   <div class="dialog narrow">
     <div class="dialog-head"><h2>&#128190; Инструменты флешки</h2><button class="dlg-x" data-close="dlg-usbtools">&#x2715;</button></div>
     <div class="muted small mono" id="usb-info" style="word-break:break-all">Читаю данные тома…</div>
+    <div class="row" style="margin-top:10px">
+      <label class="field grow">
+        <span>Флешка</span>
+        <select id="usb-vol-select" class="select" data-tip="Выберите том, с которым работают инструменты"></select>
+      </label>
+    </div>
+    <p class="muted small" id="usb-desc" style="margin:8px 0">Инструменты работают с выбранной флешкой: проверка ошибок, безопасное извлечение, метка и форматирование. «Проверить и исправить» не удаляет файлы; «Сменить метку» и «Форматировать» стирают данные. Проверка памяти записывает тестовые блоки.</p>
     <div class="row" style="margin-top:12px;flex-wrap:wrap">
       <button class="btn btn-tonal btn-sm" id="btn-usb-refresh">&#8635; Обновить</button>
       <button class="btn btn-tonal btn-sm" id="btn-usb-check" data-tip="Проверить ФС и постараться ИСПРАВИТЬ без удаления файлов (fsck, если есть на устройстве; иначе — перемонтирование)">Проверить и исправить</button>
@@ -850,6 +1065,27 @@
     <div class="dialog-foot">
       <button class="btn btn-text" data-close="dlg-usbtools">Закрыть</button>
     </div>
+  </div>
+</div>
+
+<!-- ===== Диалог — встроенный браузер файлов MTP (Android без ADB) ===== -->
+<div class="overlay hidden" id="dlg-mtp">
+  <div class="dialog">
+    <div class="dialog-head"><h2>&#128193; Файлы по USB (MTP)</h2><button class="dlg-x" data-close="dlg-mtp">&#x2715;</button></div>
+    <div class="row between">
+      <b id="mtp-device">—</b>
+      <span class="muted small">без ADB · файлы через MTP</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn btn-tonal btn-sm" id="mtp-up">&#8592; Вверх</button>
+      <button class="btn btn-tonal btn-sm" id="mtp-refresh">&#8635; Обновить</button>
+      <button class="btn btn-tonal btn-sm" id="mtp-upload">&#11014; Загрузить с ПК</button>
+      <span class="grow"></span>
+      <span class="mono small" id="mtp-path">/</span>
+    </div>
+    <div id="mtp-list" class="list" style="margin-top:10px;max-height:48vh;overflow:auto"></div>
+    <div class="muted small" id="mtp-status" style="margin-top:6px"></div>
+    <div class="dialog-foot"><button class="btn btn-text" data-close="dlg-mtp">Закрыть</button></div>
   </div>
 </div>
 
@@ -1012,6 +1248,10 @@
 <script src="procdesc.js"></script>
 <script src="vislib.js"></script>
 <script src="app.js"></script>
+<script src="camera.js"></script>
+<script src="drivers.js"></script>
+  <script src="mic.js"></script>
+  <script src="sysmic.js"></script>
 </body>
 </html>
 

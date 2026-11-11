@@ -149,7 +149,7 @@ const uiTools = {
     const d = await w.webContents.executeJavaScript(`(function(){
       const p = document.querySelector('.page.active');
       const tabs = [];
-      document.querySelectorAll('.tab').forEach(t => { if (t.offsetParent) tabs.push({ id: t.id, text: (t.textContent||'').trim(), active: t.classList.contains('act') }); });
+      document.querySelectorAll('.tab').forEach(t => { if (t.offsetParent) tabs.push({ id: t.id, text: (t.textContent||'').trim(), active: t.classList.contains('active') }); });
       return { activePage: p ? p.id : null, title: p ? (p.querySelector('h1')||{}).textContent||'' : '', visibleTabs: tabs };
     })()`, true);
     return { ok: true, ...d };
@@ -590,13 +590,18 @@ function logicTools() {
     },
 
     async get_errors(p) {
-      const n = (p && p.last) || 20;
+      const n = (typeof p === 'number' ? p : (p && p.last)) || 20;
       return { ok: true, errors: await a.getErrors(n).catch(() => []) };
     },
 
     async set_setting(key, value) {
-      const allowed = a.setSetting && await a.setSetting(key, value).catch(() => null);
-      if (!allowed) return { ok: false, error: 'Настройка не разрешена или несуществующая: ' + key };
+      let allowed = null;
+      let failure = '';
+      try { allowed = a.setSetting ? await a.setSetting(key, value) : null; }
+      catch (e) { failure = (e && e.message) || String(e); }
+      if (!allowed || allowed.ok === false) {
+        return { ok: false, error: 'Настройка не разрешена или несуществующая: ' + key + (failure ? ' (' + failure + ')' : ''), result: allowed || null };
+      }
       agentLog('info', 'set_setting', { key, value }, allowed);
       return { ok: true, result: allowed };
     },
@@ -621,6 +626,11 @@ function logicTools() {
       const r = await a.callFns.adbDisconnect(serial).catch(e => ({ ok: false, error: e.message }));
       agentLog('info', 'disconnect_device', { serial }, r);
       return r;
+    },
+
+    async detect_android_devices() {
+      const r = await this.call_app_function('devDetect', {});
+      return (r && r.result) ? r.result : r;
     },
 
     async execute_device_action(action, params) {
@@ -657,6 +667,9 @@ function logicTools() {
     },
     async device_screen_state(serial) {
       return this.call_app_function('deviceScreenState', { serial });
+    },
+    async device_ui(serial) {
+      return this.call_app_function('deviceUi', { serial });
     },
     async device_screenshot(serial) {
       return this.call_app_function('deviceScreenshot', { serial });
@@ -719,7 +732,7 @@ function logicTools() {
         transport: 'HTTP POST /mcp (JSON-RPC 2.0), GET /mcp — схема',
         areas: {
           ui: 'get_ui_tree, click_element, set_text, select_option, select_tab, scroll, take_screenshot, run_js',
-          device: 'adb_shell, adb_raw, device_settings, device_input, device_screen_state, device_screenshot, reboot_device, unlock_device',
+          device: 'adb_shell, adb_raw, device_settings, device_input, device_screen_state, device_ui, device_screenshot, reboot_device, unlock_device, detect_android_devices',
           unlock: 'unlock_device (разбудить+свайп+ввод сохранённого PIN+Enter), unlock_status, unlock_set, unlock_delete',
           apps: 'app_action (disable/enable/restore/uninstall/clear/clearCache/forceStop/run/phoneInfo), pkg_info, app_crashes, app_audit, find_packages, install_apk',
           files: 'pull_file, push_file, call_app_function(fsList/fsCat)',
@@ -728,6 +741,7 @@ function logicTools() {
         },
         notes: [
           'serial не обязателен: подставляется активное устройство (или первое живое из adb devices)',
+          'Для моделей без зрения используйте device_ui — текстовое дерево экрана с кнопками, текстами, content-desc и bounds',
           'Перед device_screenshot, зеркалом или записью проверяйте device_screen_state: при locked=true вызовите unlock_device (если сохранён PIN) или разблокируйте вручную',
           'device_settings: op=get|put|list, ns=global|secure|system — доступ к скрытым настройкам Android',
           'app_action disable сам обходит запрет прошивки: pm disable-user → pm uninstall -k --user 0',
@@ -739,6 +753,28 @@ function logicTools() {
 }
 
 // ---------- реестр tool-описаний (для схемы) ----------
+function toolInputSchema(params) {
+  const properties = {};
+  const required = [];
+  for (const [key, raw] of Object.entries(params || {})) {
+    const spec = String(raw || 'string');
+    const optional = spec.endsWith('?');
+    const types = spec.replace(/\?$/, '').split('|').map(t => {
+      if (t === 'number') return 'number';
+      if (t === 'boolean') return 'boolean';
+      if (t === 'object') return 'object';
+      if (t === 'array' || t === 'string[]') return 'array';
+      if (t === 'any') return null;
+      return 'string';
+    }).filter(Boolean);
+    properties[key] = types.length > 1 ? { type: types } : (types.length ? { type: types[0] } : {});
+    if (!optional) required.push(key);
+  }
+  const schema = { type: 'object', properties, additionalProperties: true };
+  if (required.length) schema.required = required;
+  return schema;
+}
+
 const TOOL_DEFS = [
   ['get_app_window', 'Получить список открытых окон программы', { }],
   ['get_ui_tree', 'Полное дерево интерфейса: разделы, кнопки, поля, списки, координаты, доступность', { }],
@@ -773,6 +809,7 @@ const TOOL_DEFS = [
   ['get_setting', 'Прочитать настройку', { key: 'string' }],
   ['connect_device', 'Подключить Android-устройство по host:port', { host: 'string', port: 'number' }],
   ['disconnect_device', 'Отключить устройство', { serial: 'string?' }],
+  ['detect_android_devices', 'Найти Android: ADB, USB (PnP/MTP), Wi-Fi (mDNS) и соседей в локальной сети', { }],
   ['execute_device_action', 'Выполнить действие с телефоном (см. functions)', { action: 'string', params: 'object?' }],
   // полный доступ к устройству
   ['adb_shell', 'ЛЮБАЯ shell-команда на устройстве (pm, settings, cmd, dumpsys, am, service call…)', { cmd: 'string', serial: 'string?' }],
@@ -780,6 +817,7 @@ const TOOL_DEFS = [
   ['device_settings', 'Скрытые настройки Android: op=get|put|list, ns=global|secure|system', { op: 'string', ns: 'string?', key: 'string?', value: 'string?' }],
   ['device_input', 'Ввод на телефоне: tap/swipe/text/key/combo', { type: 'string', p: 'object?' }],
   ['device_screen_state', 'Состояние экрана/блокировки; проверка перед screenshot, зеркалом и записью', { serial: 'string?' }],
+  ['device_ui', 'Текстовое дерево экрана Android: кнопки, тексты, content-desc, границы, кликабельность — для моделей без зрения', { serial: 'string?' }],
   ['device_screenshot', 'Снимок экрана ТЕЛЕФОНА в PNG (файл в «Сохранения\\Агент»); требует разблокированного экрана', { serial: 'string?' }],
   ['app_action', 'Действие с приложением: disable/enable/restore/uninstall/clear/clearCache/forceStop/run/phoneInfo', { action: 'string', pkg: 'string', serial: 'string?' }],
   ['pkg_info', 'Подробно о пакете: версия, код, путь APK, даты, установлен ли', { pkg: 'string', serial: 'string?' }],
@@ -822,10 +860,10 @@ async function dispatch(name, params) {
     take_screenshot: ['p'], get_visual_state: [], get_app_state: [], get_app_window: [], get_ui_tree: [], get_active_tab: [], run_js: ['p'],
     call_app_function: ['name', 'params'], run_command: ['name', 'params'], get_task_list: [], cancel_task: ['id'],
     get_logs: ['last'], get_errors: ['last'], set_setting: ['key', 'value'], get_setting: ['key'],
-    connect_device: ['host', 'port'], disconnect_device: ['serial'], execute_device_action: ['action', 'params'],
+    connect_device: ['host', 'port'], disconnect_device: ['serial'], detect_android_devices: [], execute_device_action: ['action', 'params'],
     // полный доступ
     adb_shell: ['cmd', 'serial'], adb_raw: ['args', 'serial'], device_settings: ['op', 'ns', 'key', 'value'],
-    device_input: ['type', 'p'], device_screen_state: ['serial'], device_screenshot: ['serial'], app_action: ['action', 'pkg', 'serial'],
+    device_input: ['type', 'p'], device_screen_state: ['serial'], device_ui: ['serial'], device_screenshot: ['serial'], app_action: ['action', 'pkg', 'serial'],
     pkg_info: ['pkg', 'serial'], app_crashes: ['pkg', 'serial', 'limit'], app_audit: ['pkg', 'serial'], find_packages: ['query', 'serial'], install_apk: ['path', 'serial'],
     pull_file: ['remote', 'serial'], push_file: ['local', 'remote', 'serial'], reboot_device: ['mode', 'serial'],
     unlock_device: ['serial', 'step', 'type'], unlock_status: ['serial'], unlock_list: [], unlock_set: ['pin', 'serial', 'type'], unlock_delete: ['serial'], unlock_delkey: ['key'],
@@ -862,7 +900,7 @@ function startServer() {
     if (req.method === 'GET' && url === '/mcp') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
-        ok: true, name: 'adb-wifi-connector-mcp', version: '2.12.0',
+        ok: true, name: 'adb-wifi-connector-mcp', version: '3.0.0',
         about: 'ADB Wi-Fi Коннектор — подключение Android по Wi-Fi/USB, файлы, приложения, трансляция, полный ADB-доступ.',
         transport: 'HTTP POST /mcp (JSON-RPC 2.0); GET /mcp — эта схема',
         enabled: state.enabled,
@@ -886,7 +924,7 @@ function startServer() {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({
         ok: true,
-        tools: TOOL_DEFS.map(d => ({ name: d[0], description: d[1], inputSchema: { type: 'object', properties: Object.fromEntries(Object.entries(d[2]).map(([k, v]) => [k, { type: typeof v === 'number' ? 'number' : 'string' }])) } }))
+        tools: TOOL_DEFS.map(d => ({ name: d[0], description: d[1], inputSchema: toolInputSchema(d[2]) }))
       }, null, 2));
       return;
     }
@@ -901,11 +939,15 @@ function startServer() {
         // JSON-RPC notification (без id) не должен получать ответ
         if (msg.id === undefined) { res.writeHead(202); res.end(); return; }
         if (msg.method === 'initialize') {
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          const supported = ['2024-11-05', '2025-03-26', '2025-06-18'];
+          const requested = msg.params && msg.params.protocolVersion;
+          const protocolVersion = supported.includes(requested) ? requested : '2024-11-05';
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Mcp-Session-Id': 'adbwifi-' + process.pid });
           res.end(JSON.stringify(rpcOk(msg.id, {
-            protocolVersion: '2024-11-05',
+            protocolVersion,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: 'adb-wifi-connector-mcp', version: '2.12.0' }
+            serverInfo: { name: 'adb-wifi-connector-mcp', version: '3.0.0' },
+            instructions: 'ADB Wi-Fi Коннектор: UI и полный ADB-доступ. serial можно не указывать. Включение: agent/set-enabled.'
           })));
           return;
         }
@@ -916,7 +958,7 @@ function startServer() {
         }
         if (msg.method === 'tools/list') {
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify(rpcOk(msg.id, { tools: TOOL_DEFS.map(d => ({ name: d[0], description: d[1], inputSchema: { type: 'object', properties: Object.fromEntries(Object.entries(d[2]).map(([k, v]) => [k, { type: typeof v === 'number' ? 'number' : 'string' }])) } })) })));
+          res.end(JSON.stringify(rpcOk(msg.id, { tools: TOOL_DEFS.map(d => ({ name: d[0], description: d[1], inputSchema: toolInputSchema(d[2]) })) })));
           return;
         }
         if (msg.method === 'tools/call' || msg.method === 'call_tool') {
@@ -936,7 +978,9 @@ function startServer() {
         if (msg.method === 'agent/set-enabled') {
           const v = !!(msg.params && msg.params.enabled);
           state.enabled = v;
-          if (appRef && appRef.config) { appRef.config.agentEnabled = v; try { appRef.saveConfig(); } catch (e) {} }
+          if (appRef && appRef.setSetting) {
+            try { await appRef.setSetting('agentEnabled', v); } catch (e) {}
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(rpcOk(msg.id, { ok: true, enabled: state.enabled }))); return;
         }
@@ -974,7 +1018,7 @@ function startServer() {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'mcp-endpoint.json'), JSON.stringify({
         name: 'adb-wifi-connector-mcp',
-        version: '2.12.0',
+        version: '3.0.0',
         description: 'ADB Wi-Fi Коннектор: подключение Android по Wi-Fi/USB, файлы, приложения, трансляция экрана, полный ADB-доступ (shell, скрытые настройки, установка/удаление, ввод, снимки экрана).',
         endpoint: 'http://127.0.0.1:' + PORT + '/mcp',
         schema: 'http://127.0.0.1:' + PORT + '/mcp/schema',
@@ -982,7 +1026,7 @@ function startServer() {
         enabled: state.enabled,
         enableHint: 'Включите «Управление агентом» в Настройках программы (или agent/set-enabled {enabled:true})',
         authHint: TOKEN_ENV ? 'Требуется заголовок Authorization: Bearer <MCP_TOKEN>' : 'Без токена (локальный доступ)',
-        coreTools: ['get_app_state', 'adb_shell', 'adb_raw', 'device_settings', 'app_action', 'find_packages', 'pkg_info', 'device_screen_state', 'device_screenshot', 'install_apk', 'pull_file', 'push_file', 'device_input', 'reboot_device', 'unlock_device', 'unlock_status', 'get_ui_tree', 'click_element', 'take_screenshot', 'describe_capabilities'],
+        coreTools: ['get_app_state', 'adb_shell', 'adb_raw', 'device_settings', 'app_action', 'find_packages', 'pkg_info', 'device_screen_state', 'device_ui', 'device_screenshot', 'install_apk', 'pull_file', 'push_file', 'device_input', 'reboot_device', 'unlock_device', 'unlock_status', 'detect_android_devices', 'get_ui_tree', 'click_element', 'take_screenshot', 'describe_capabilities'],
         updatedAt: new Date().toISOString()
       }, null, 2), 'utf8');
     } catch (e) {}
@@ -996,6 +1040,7 @@ module.exports = {
   startServer,
   setEnabled(v) { state.enabled = !!v; if (!v) { state.running = false; } },
   isEnabled() { return state.enabled; },
+  endpoint() { return 'http://127.0.0.1:' + PORT + '/mcp'; },
   resetStop() { state.stopRequested = false; },
   stop() { state.stopRequested = true; },
   cancelTask(id) { tasks.push({ id, kind: 'manual', title: 'отмена по запросу', status: 'canceled', startedAt: Date.now(), finishedAt: Date.now() }); },

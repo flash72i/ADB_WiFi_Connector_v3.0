@@ -10,11 +10,16 @@ const $$ = (s) => Array.from(document.querySelectorAll(s));
 let state = null;
 let devices = [];          // [{serial, state, model, android, props}]
 let activeSerial = null;   // ЕДИНСТВЕННОЕ активное устройство (R8)
+let mtpDevices = [];       // USB MTP-устройства без ADB: [{name, id, status, cls}]
+let mtpDeselected = false; // пользователь явно нажал «Отключить» у MTP — не выбирать обратно автоматически
+function isMtpSerial(s) { return String(s || '').startsWith('mtp:'); }
+function mtpNameOf(s) { return isMtpSerial(s) ? String(s).slice(4) : ''; }
 Object.defineProperty(window, 'activeSerial', { get: () => activeSerial, configurable: true });
 let savedItems = [];       // «Мои устройства» — для офлайн-опций селектора (R7)
 let scanFound = [];
 let recTimer = null, recStart = 0;
 let logcatOn = false, logcatPaused = false, logcatBuf = [];
+let agentMcpEndpoint = 'http://127.0.0.1:3939/mcp';
 
 /* ---------- утилиты ---------- */
 // оборачивает input в контейнер с крестиком очистки внутри поля
@@ -48,9 +53,36 @@ function snack(msg, ms = 3500) {
   // F19: каждая ошибка, показанная в интерфейсе, обязана попасть в журнал (app.log = только ошибки)
   if (ERR_MSG_RE.test(String(msg))) { try { window.api.uiLog(String(msg).slice(0, 400)); } catch (e) {} }
   snackEl = snackEl || $('#snackbar');
-  snackEl.textContent = msg; snackEl.classList.remove('hidden');
   clearTimeout(snackEl._t);
-  snackEl._t = setTimeout(() => snackEl.classList.add('hidden'), ms);
+  const isErr = ERR_MSG_RE.test(String(msg)) || !!(arguments[2] && arguments[2].error);
+  snackEl.innerHTML = '';
+  const text = document.createElement('span');
+  text.className = 'snack-text';
+  text.textContent = msg;
+  snackEl.appendChild(text);
+  if (isErr) {
+    const copy = document.createElement('button');
+    copy.type = 'button'; copy.className = 'snack-btn'; copy.textContent = 'Копировать';
+    copy.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        if (window.api && window.api.copyText) await window.api.copyText(String(msg));
+        else await navigator.clipboard.writeText(String(msg));
+        copy.textContent = 'Скопировано';
+      } catch (err2) { copy.textContent = 'Не удалось'; }
+    };
+    const close = document.createElement('button');
+    close.type = 'button'; close.className = 'snack-btn snack-close'; close.textContent = '×';
+    close.onclick = (e) => { e.stopPropagation(); clearTimeout(snackEl._t); snackEl.classList.add('hidden'); };
+    snackEl.appendChild(copy);
+    snackEl.appendChild(close);
+  }
+  snackEl.classList.remove('hidden');
+  if (isErr) {
+    snackEl._t = null; // ошибка остаётся, пока её не закроют или не сменят
+  } else {
+    snackEl._t = setTimeout(() => snackEl.classList.add('hidden'), ms);
+  }
 }
 function openDlg(id) { $('#' + id).classList.remove('hidden'); }
 function closeDlg(id) { $('#' + id).classList.add('hidden'); }
@@ -79,20 +111,33 @@ $('#input-field').addEventListener('keydown', e => { if (e.key === 'Enter') fini
 // подтверждение вместо нативного confirm() — не выбивается из кастомного окна (A1)
 // opts.checkbox — «Больше не спрашивать»: возвращает {ok, dontAsk} вместо boolean;
 // подтверждающие галочки запоминаются в localStorage — владелец больше не кликает по сто раз
-let confirmCb = null, confirmCancelCb = null;
+let confirmQueue = [], confirmActive = null;
+function showNextConfirm() {
+  if (confirmActive || !confirmQueue.length) return;
+  const req = confirmQueue.shift();
+  confirmActive = req;
+  $('#confirm-title').textContent = req.title;
+  $('#confirm-body').textContent = req.body || '';
+  const cb = $('#confirm-dontask');
+  if (cb) {
+    if (req.opts.checkbox) { cb.parentElement.classList.remove('hidden'); cb.checked = false; }
+    else cb.parentElement.classList.add('hidden');
+  }
+  openDlg('dlg-confirm');
+}
+function finishConfirm(ok) {
+  if (!confirmActive) { closeDlg('dlg-confirm'); return; }
+  const req = confirmActive;
+  confirmActive = null;
+  const dontAsk = !!(ok && req.opts.checkbox && $('#confirm-dontask') && $('#confirm-dontask').checked);
+  closeDlg('dlg-confirm');
+  req.resolve({ ok: !!ok, dontAsk });
+  setTimeout(showNextConfirm, 0);
+}
 function uiConfirm(title, body, opts) {
-  opts = opts || {};
   return new Promise(resolve => {
-    confirmCb = () => resolve({ ok: true, dontAsk: !!(opts.checkbox && $('#confirm-dontask') && $('#confirm-dontask').checked) });
-    confirmCancelCb = () => resolve({ ok: false, dontAsk: false });
-    $('#confirm-title').textContent = title;
-    $('#confirm-body').textContent = body || '';
-    const cb = $('#confirm-dontask');
-    if (cb) {
-      if (opts.checkbox) { cb.parentElement.classList.remove('hidden'); cb.checked = false; }
-      else cb.parentElement.classList.add('hidden');
-    }
-    openDlg('dlg-confirm');
+    confirmQueue.push({ title, body, opts: opts || {}, resolve });
+    showNextConfirm();
   });
 }
 async function confirmOnce(key, title, body) {
@@ -218,7 +263,7 @@ $$('.rail-item').forEach(b => b.onclick = () => goPage(b.dataset.page));
 $$('[data-close]').forEach(b => b.onclick = () => {
   if (b.dataset.close === 'dlg-input') finishInput(false);
   if (b.dataset.close === 'dlg-qrpc' && qrActive) { qrActive = false; window.api.qrCancel(); }
-  if (b.dataset.close === 'dlg-confirm' && confirmCancelCb) { const c = confirmCancelCb; confirmCancelCb = null; confirmCb = null; c(); }
+  if (b.dataset.close === 'dlg-confirm') finishConfirm(false);
   // закрытие просмотрщика фото ИЗ ПОЛНОГО ЭКРАНА — сначала выходим из fullscreen
   // и снимаем «внутренний» полноэкранный класс, иначе окно программы оставалось
   // развёрнутым на весь монитор и интерфейс не отвечал
@@ -230,10 +275,11 @@ $$('[data-close]').forEach(b => b.onclick = () => {
     } catch (e) {}
     const shell = $('#imgview-shell');
     if (shell) shell.classList.remove('imgview-full');
+    ivThumbsClear();
   }
   closeDlg(b.dataset.close);
 });
-$('#confirm-yes').onclick = () => { closeDlg('dlg-confirm'); if (confirmCb) confirmCb(); confirmCb = null; confirmCancelCb = null; };
+$('#confirm-yes').onclick = () => finishConfirm(true);
 
 $$('.tabs .tab').forEach(t => t.onclick = () => {
   $$('.tabs .tab').forEach(x => x.classList.toggle('active', x === t));
@@ -242,9 +288,21 @@ $$('.tabs .tab').forEach(t => t.onclick = () => {
 
 /* ---------- состояние ---------- */
 let savesDir = '';
+
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.body.dataset.theme = next;
+  const icon = $('#theme-icon');
+  if (icon) icon.textContent = next === 'light' ? '☾' : '☀';
+  const btn = $('#btn-theme-toggle');
+  if (btn) btn.title = next === 'light' ? 'Включить тёмную тему' : 'Включить светлую тему';
+  const select = $('#set-theme');
+  if (select) select.value = next;
+}
+
 async function loadState() {
   state = await window.api.getState();
-  document.body.dataset.theme = state.config.theme || 'dark';
+  applyTheme(state.config.theme || 'dark');
   // по просьбе владельца версия в интерфейсе не показывается
   if ($('#tb-version')) $('#tb-version').textContent = '';
   if ($('#about-ver')) $('#about-ver').textContent = '';
@@ -253,8 +311,9 @@ async function loadState() {
   $('#data-dir-label').textContent = 'Все сохранения хранятся строго в папке с программой: ' + savesDir;
   // поля путей adb/scrcpy убраны из настроек — используются встроенный adb и автопоиск scrcpy
   $('#set-autostart').checked = !!state.config.autostart;
-  $('#set-tray').checked = state.config.closeToTray !== false;
+  $('#set-close-mode').value = state.config.closeToTray ? 'tray' : 'quit';
   $('#set-autoreconnect').checked = !!state.config.autoreconnect;
+  if ($('#dev-autoconnect')) $('#dev-autoconnect').checked = !!state.config.autoconnect;
   $('#set-sounds').checked = state.config.sounds !== false;
   $('#set-autolast').checked = !!state.config.autolast;
   snd.on = state.config.sounds !== false;
@@ -267,8 +326,8 @@ async function refreshAdbStatus() {
   const v = await window.api.adbVersion();
   if (v.ok) {
     // слово «adb» в левой панели убрано (по просьбе владельца) — остаётся только линия-разделитель
-    $('#adb-status').textContent = '';
-    $('#adb-status').dataset.tip = 'adb ' + v.version;
+    const st = $('#adb-status');
+    if (st) { st.textContent = ''; st.removeAttribute('data-tip'); }
     if ($('#adb-ver-label')) $('#adb-ver-label').textContent = '— версия ' + v.version;
     $('#adb-banner').classList.add('hidden');
   } else {
@@ -279,7 +338,7 @@ async function refreshAdbStatus() {
 
 /* ---------- ЕДИНОЕ активное устройство (R7/R8) ---------- */
 function onlineDevices() { return devices.filter(d => d.state === 'device'); }
-function isOnline(serial) { return onlineDevices().some(d => d.serial === serial); }
+function isOnline(serial) { return isMtpSerial(serial) || onlineDevices().some(d => d.serial === serial); }
 // USB — это «голый» серийник (45081e2b). Беспроводные бывают двух видов:
 // IP:порт (192.0.2.42:5555) И mDNS-имя adb-<serial>-<suffix>._adb-tls-connect._tcp —
 // у mDNS двоеточия нет, из-за чего раньше ВСЕ Wi-Fi-устройства показывались как USB.
@@ -298,18 +357,22 @@ const CONN_ICONS = {
 };
 function connIcon(serial) {
   if (!serial) return '';
+  if (isMtpSerial(serial)) {
+    return '<span class="conn-ico usb" data-tip="USB MTP: только файлы">' + CONN_ICONS.usb + '</span>';
+  }
   const usb = isUsb(serial);
   const kind = usb ? 'usb' : 'wifi';
-  const tip = usb ? 'Подключено по USB' : 'Подключено по Wi-Fi';
+  const tip = usb ? 'Подключено по USB (ADB)' : 'Подключено по Wi-Fi (ADB)';
   return '<span class="conn-ico ' + kind + '" data-tip="' + tip + '">' + CONN_ICONS[kind] + '</span>';
 }
 function nameOf(serial) {
+  if (isMtpSerial(serial)) return mtpNameOf(serial);
   const d = devices.find(x => x.serial === serial);
   return (d && (d.friendly || d.model || d.props && d.props.product)) || serial || '';
 }
 function stText(serial) {
   if (!serial) return '';
-  if (isOnline(serial)) return serial === activeSerial ? '✓ активно' : '● в сети' + (isUsb(serial) ? ' [USB]' : '');
+  if (isOnline(serial)) return serial === activeSerial ? '✓ активно' : '● в сети' + (isUsb(serial) ? ' [USB ADB]' : ' [ADB]');
   return '○ не подключено';
 }
 function chipClass(serial) {
@@ -320,6 +383,11 @@ function chipClass(serial) {
 function renderTbDevice() {
   const sel = $('#tb-device');
   const online = onlineDevices();
+  // MTP показываем только когда он реально выбран активным. Иначе при живом ADB
+  // в списке висел бы второй «HONOR 9X (MTP)», хотя пользователь его не выбирал.
+  const mtpList = activeSerial && isMtpSerial(activeSerial)
+    ? (mtpDevices || []).filter(u => 'mtp:' + u.name === activeSerial).map(u => ({ serial: 'mtp:' + u.name, label: u.name }))
+    : [];
   // офлайн-адреса из «Моих устройств» и истории — для быстрого подключения из любого места
   const hist = (state && state.history) || [];
   const lastBy = {};
@@ -334,22 +402,27 @@ function renderTbDevice() {
     if (!online.some(d => d.serial === ser) && !offline.some(o => o.serial === ser)) offline.push({ serial: ser, label: h.host + ':' + h.port, lastTs: h.lastTs });
   }
   let html = '';
-  if (!online.length && !offline.length) {
+  if (!online.length && !offline.length && !mtpList.length) {
     html = '<option value="">Нет устройства — подключите ниже</option>';
   } else {
     for (const d of online) {
       const act = d.serial === activeSerial;
-      html += `<option value="${esc(d.serial)}">${act ? '✓' : '●'} ${esc(d.friendly || d.model || d.serial)}${isUsb(d.serial) ? ' [USB]' : ''} — ${act ? 'активно' : 'в сети'}</option>`;
+      html += `<option value="${esc(d.serial)}">${act ? '✓' : '●'} ${esc(d.friendly || d.model || d.serial)}${isUsb(d.serial) ? ' [USB ADB]' : ' [ADB]'} — ${act ? 'активно' : 'в сети'}</option>`;
     }
     for (const o of offline) {
       const ago = o.lastTs ? relTime(o.lastTs) : '';
       html += `<option value="${esc(o.serial)}">○ ${esc(o.label)} — не подключено${ago ? ' · последнее: ' + esc(ago) : ''}</option>`;
     }
-    if (!online.some(d => d.serial === activeSerial)) html = `<option value="">— устройство не выбрано —</option>` + html;
+    for (const m of mtpList) {
+      const act = m.serial === activeSerial;
+      html += `<option value="${esc(m.serial)}">${act ? '✓' : '📱'} ${esc(m.label)} (MTP) — ${act ? 'активно' : 'только файлы'}</option>`;
+    }
+    const hasActive = !!activeSerial && (online.some(d => d.serial === activeSerial) || isMtpSerial(activeSerial));
+    if (!hasActive) html = `<option value="">— устройство не выбрано —</option>` + html;
   }
   const prev = sel.value;
   sel.innerHTML = html;
-  const want = activeSerial && online.some(d => d.serial === activeSerial) ? activeSerial : '';
+  const want = activeSerial && (online.some(d => d.serial === activeSerial) || isMtpSerial(activeSerial)) ? activeSerial : '';
   sel.value = want || sel.options[0] && sel.options[0].value || '';
   sel.setAttribute('data-tip', sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : 'Активное устройство');
   // значок Wi-Fi/USB рядом с выпадающим списком
@@ -362,8 +435,9 @@ $('#tb-device').onchange = () => {
   const v = $('#tb-device').value;
   if (!v) return;
   if (isOnline(v)) {
+    if (isMtpSerial(v)) setFsListMode();
     setActive(v);
-    snack('Активное устройство: ' + nameOf(v) + ' (' + v + ')');
+    snack('Активное устройство: ' + nameOf(v) + (isMtpSerial(v) ? ' (MTP)' : ' (' + v + ')'));
   } else {
     const [h, p] = v.split(':');
     doConnect(h, +p);
@@ -419,6 +493,7 @@ function resetActiveDeviceState() {
     if (shellOn) {
       window.api.shellStop().catch(() => {});
       shellOn = false;
+      shellSerial = null;
       const sv = $('#shell-view');
       if (sv) sv.textContent += '\n[переключение устройства — сессия остановлена]\n';
     }
@@ -438,11 +513,18 @@ function resetActiveDeviceState() {
     fsItems = [];
     fsCatKind = null;
     fsCatItems = [];
+    fsCatCounts = {};
+    fsCatCache = {};
+    fsCatCountsSerial = null;
+    fsCatCountsTs = 0;
+    fsCatCountsLoading = false;
     fsClip = { paths: [], cut: false };
     fsFlash = null;
     thumbQueue.length = 0;
     fsApkQueue.length = 0;
     if (thumbObs) { thumbObs.disconnect(); thumbObs = null; }
+    const st = $('#fs-storage');
+    if (st) st.textContent = '';
   } catch (e) {}
   ['dlg-appinfo', 'dlg-crashlog', 'dlg-appaudit', 'dlg-phonetransfer', 'dlg-clipboard'].forEach(id => {
     try { closeDlg(id); } catch (e) {}
@@ -463,12 +545,34 @@ function setActive(serial) {
   }
   if (prev) resetActiveDeviceState();
   activeSerial = next;
+  if (isMtpSerial(next)) {
+    mtpDeselected = false;
+    fsCatKind = null;
+    fsDir = '/';
+    const mtpName = mtpNameOf(next);
+    if (mtpInlineState.device !== mtpName) mtpInlineState = { device: mtpName, path: [], loaded: false, viewInit: false };
+    mtpHist = []; mtpFwd = [];
+    mtpButtons();
+    // для MTP по умолчанию — список (владельцу так проще); переключатель «Вид» остаётся
+    setFsListMode();
+    if ($('#page-files') && $('#page-files').classList.contains('active')) { mtpFsRender(); renderFsVolumes(); }
+    renderTbDevice();
+    renderActiveCard();
+    renderDevices();
+    renderSavedChipsState();
+    updateToolsState();
+    clipAutoStart();
+    return;
+  }
+  hideMtpInline();
   invalidateAppsCache();
   // пользователь уже на вкладке приложений — сразу перечитываем список нового телефона
   if (next && $('#page-apps') && $('#page-apps').classList.contains('active')) appsLoad();
   if ($('#page-files') && $('#page-files').classList.contains('active')) {
     if (next) fsNavigate('/sdcard');
     else fsRender();
+    renderFsVolumes();
+    
   }
   renderTbDevice();
   renderActiveCard();
@@ -481,12 +585,26 @@ function setActive(serial) {
 /* карточка активного устройства на странице «Подключение» */
 async function renderActiveCard() {
   const card = $('#active-card'), empty = $('#active-empty');
+  const favBtn = $('#ad-fav');
   const lastEl = $('#active-empty-last');
   if (lastEl) lastEl.textContent = '';
   const s = activeSerial;
+  if (isMtpSerial(s)) {
+    card.classList.remove('hidden');
+    empty.classList.add('hidden');
+    if (favBtn) favBtn.classList.add('hidden');
+    $('#ad-name').textContent = nameOf(s);
+    $('#ad-serial').textContent = 'MTP · только файлы';
+    $('#ad-chips').innerHTML = '<b>USB MTP</b>';
+    $('#tools-active-label').textContent = 'Устройство: ' + nameOf(s) + ' (MTP)';
+    $('#fs-active-label').textContent = 'Устройство: ' + nameOf(s) + ' (MTP)';
+    $('#apps-active-label').textContent = 'Устройство: ' + nameOf(s) + ' (MTP)';
+    return;
+  }
   if (!s || !isOnline(s)) {
     card.classList.add('hidden');
     empty.classList.remove('hidden');
+    if (favBtn) favBtn.classList.add('hidden');
     if (lastEl) {
       const last = ((state && state.history) || []).slice().sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0))[0];
       if (last && last.lastTs) {
@@ -501,14 +619,27 @@ async function renderActiveCard() {
   card.classList.remove('hidden');
   empty.classList.add('hidden');
   $('#ad-name').textContent = nameOf(s);
-  $('#ad-serial').textContent = s + (isUsb(s) ? ' · USB' : '');
+  if (favBtn) {
+    const canFav = !isUsb(s) && String(s).includes(':');
+    favBtn.classList.toggle('hidden', !canFav);
+    if (canFav) {
+      const fav = isFavSerial(s);
+      favBtn.classList.toggle('on', fav);
+      favBtn.innerHTML = fav ? '&#9733;' : '&#9734;';
+      favBtn.setAttribute('data-tip', fav ? 'Убрать из избранного' : 'В избранное');
+      favBtn.onclick = () => toggleFavorite(s, nameOf(s));
+    } else {
+      favBtn.onclick = null;
+    }
+  }
+  $('#ad-serial').textContent = s + (isUsb(s) ? ' · USB ADB' : ' · Wi-Fi ADB');
   const d = devices.find(x => x.serial === s);
   const chips = [];
   if (d && d.android) chips.push('Android <b>' + esc(d.android) + '</b>');
   const info = infoCache[s] && infoCache[s].info;
   if (info && info.battery && info.battery !== '?') chips.push('Батарея <b>' + esc(info.battery) + '%</b>');
   if (pingCache[s] != null) chips.push('Пинг <b>' + pingCache[s] + ' мс</b>');
-  chips.push(isUsb(s) ? '<b>USB</b>' : '<b>Wi-Fi</b>');
+  chips.push(isUsb(s) ? '<b>USB · ADB</b>' : '<b>Wi-Fi · ADB</b>');
   $('#ad-chips').innerHTML = chips.join('');
   const label = nameOf(s);
   $('#tools-active-label').textContent = 'Устройство: ' + label;
@@ -555,11 +686,14 @@ async function refreshDevices() {
     _seenDev.add(key);
     return true;
   });
+  mtpDevices = await getUsbPnp().catch(() => []);
   const online = onlineDevices();
   // потеря активного устройства (A1-ревью): сбрасываем, глушим привязанные инструменты,
   // если в сети ровно одно — назначаем его активным автоматически.
   // только после 3 подряд пропусков (~15 с), чтобы не терять устройство из-за сбоя.
-  const activeGone = !!activeSerial && !online.some(d => d.serial === activeSerial);
+  const activeGone = !!activeSerial && !(isMtpSerial(activeSerial)
+    ? mtpDevices.some(u => 'mtp:' + u.name === activeSerial)
+    : online.some(d => d.serial === activeSerial));
   if (activeGone) {
     if (_activeMissSerial !== activeSerial) { _activeMissSerial = activeSerial; _activeMiss = 0; }
     _activeMiss++;
@@ -572,11 +706,13 @@ async function refreshDevices() {
     setActive(null);
     _activeMiss = 0;
     _activeMissSerial = null;
-    if (online.length === 1) setActive(online[0].serial);
   }
   // если активное не выбрано, а устройства в сети есть — выбираем ПЕРВОЕ,
   // иначе шапка оставалась «устройство не выбрано» при подключённом телефоне.
-  if (!activeSerial && online.length) setActive(online[0].serial);
+  // Активное устройство выбирает только пользователь: без авто-подключения при старте.
+  if (state.config.autoconnect && !activeSerial && online.length === 1) {
+    setActive(online[0].serial);
+  }
   renderTbDevice();
   renderActiveCard();
   renderDevices();
@@ -595,13 +731,39 @@ function logLostActive(serial) {
   try { window.api.uiLog('active lost: ' + serial); } catch (e) {}
 }
 
+function isFavSerial(serial) {
+  const s = String(serial || '');
+  if (!s || isUsb(s) || isMtpSerial(s) || !s.includes(':')) return false;
+  const [host, port] = s.split(':');
+  const p = Number(port);
+  if (!host || !Number.isFinite(p)) return false;
+  return (state.favorites || []).some(f => String(f.host) === host && Number(f.port) === p);
+}
+
+async function toggleFavorite(serial, model) {
+  const s = String(serial || '');
+  if (!s || isUsb(s) || isMtpSerial(s) || !s.includes(':')) return;
+  const [host, port] = s.split(':');
+  const p = Number(port);
+  if (!host || !Number.isFinite(p)) return;
+  try {
+    state.favorites = await window.api.favToggle({ host, port: p, model: model || nameOf(s) });
+    renderActiveCard();
+    renderDevices();
+    renderHistory();
+    renderFavorites();
+  } catch (e) {
+    snack('Не удалось изменить избранное');
+  }
+}
+
 function renderDevices() {
   const box = $('#device-list');
   const online = onlineDevices();
   // активное устройство показано в карточке ВЫШЕ — не дублируем его в списке,
   // иначе «одно и то же устройство в двух местах». Список = остальные подключённые.
   const others = online.filter(d => d.serial !== activeSerial);
-  $('#device-empty').classList.toggle('hidden', others.length > 0);
+  $('#device-empty').classList.add('hidden');
   if (!others.length) {
     const inner = online.length
       ? '<div class="empty">Подключено только активное устройство — оно показано выше.</div>'
@@ -617,7 +779,7 @@ function renderDevices() {
     return `<div class="card dev-card">
       <div class="dev-name"><span class="dot${act ? '' : ' off'}"></span>${connIcon(d.serial)}${esc(d.friendly || d.model || d.props.product || d.serial)}
         <span class="${chipClass(d.serial)}">${stText(d.serial)}</span>
-        ${isNet ? `<button class="star ${fav ? 'on' : ''}" data-fav="${esc(d.serial)}" data-tip="В избранное">&#9733;</button>` : ''}
+        ${isNet ? `<button class="star ${fav ? 'on' : ''}" data-fav="${esc(d.serial)}" data-tip="${fav ? 'Убрать из избранного' : 'В избранное'}">${fav ? '&#9733;' : '&#9734;'}</button>` : ''}
       </div>
       <div class="dev-serial" data-copy="${esc(d.serial)}" data-tip="Нажмите, чтобы скопировать">${esc(d.serial)} <span id="info-${esc(d.serial).replace(/[:.]/g, '_')}"></span></div>
       <div class="dev-actions">
@@ -669,11 +831,9 @@ function renderDevices() {
       if (el) el.textContent = t ? '· ' + t : '';
     });
   }
-  box.querySelectorAll('[data-fav]').forEach(b => b.onclick = async () => {
-    const [host, port] = b.dataset.fav.split(':');
+  box.querySelectorAll('[data-fav]').forEach(b => b.onclick = () => {
     const d = devices.find(x => x.serial === b.dataset.fav);
-    state.favorites = await window.api.favToggle({ host, port: +port, model: d && d.model });
-    renderDevices(); renderFavorites();
+    toggleFavorite(b.dataset.fav, d && (d.friendly || d.model));
   });
 }
 // вместо пустой заглушки — реальное обновление статусов «Моих устройств» и «Избранного».
@@ -692,14 +852,20 @@ function renderHistory() {
   $('#hist-empty').classList.toggle('hidden', h.length > 0);
   box.innerHTML = h.map(x => {
     const ser = x.host + ':' + x.port;
+    const fav = isFavSerial(ser);
     return `<div class="list-row">
       <span class="scan-ico" data-tip="Подключение по Wi-Fi">${CONN_ICONS.wifi}</span>
       <span class="mono grow2" data-copy="${esc(ser)}" style="cursor:copy">${esc(x.model || 'Без имени')} <span class="muted">${esc(x.host)}:${esc(x.port)}</span> <span class="${chipClass(ser)}">${stText(ser)}</span></span>
       <span class="muted" title="${esc(x.lastTs ? fmtTs(x.lastTs) : '')}">${esc(x.lastTs ? relTime(x.lastTs) : '')}</span>
+      <button class="star ${fav ? 'on' : ''}" data-hfav="${esc(ser)}" data-tip="${fav ? 'Убрать из избранного' : 'В избранное'}">${fav ? '&#9733;' : '&#9734;'}</button>
       <button class="btn btn-tonal btn-sm" data-hc="${esc(ser)}">Подключить</button>
       <button class="btn btn-text btn-sm" data-hx="${esc(ser)}" data-tip="Убрать">&#x2715;</button>
     </div>`;
   }).join('');
+  box.querySelectorAll('[data-hfav]').forEach(b => b.onclick = () => {
+    const x = ((state && state.history) || []).find(v => v.host + ':' + v.port === b.dataset.hfav);
+    toggleFavorite(b.dataset.hfav, x && x.model);
+  });
   box.querySelectorAll('[data-hc]').forEach(b => b.onclick = () => {
     const [host, port] = b.dataset.hc.split(':');
     doConnect(host, +port);
@@ -737,7 +903,7 @@ function renderFavorites() {
     return `<div class="card dev-card">
       <div class="dev-name"><span class="dot${isOnline(ser) ? (ser === activeSerial ? '' : ' off') : ' off'}"></span>${connIcon(ser)}${esc(x.model || x.host)}
         <span class="${chipClass(ser)}">${stText(ser)}</span>
-        <button class="star on" data-favr="${esc(ser)}">&#9733;</button></div>
+        <button class="star on" data-favr="${esc(ser)}" data-tip="Убрать из избранного">&#9733;</button></div>
       <div class="dev-serial" data-copy="${esc(ser)}" style="cursor:copy">${esc(ser)}</div>
       <div class="dev-actions"><button class="btn btn-tonal btn-sm" data-fc="${esc(ser)}">Подключить</button></div>
     </div>`;
@@ -746,10 +912,9 @@ function renderFavorites() {
     const [host, port] = b.dataset.fc.split(':');
     doConnect(host, +port);
   });
-  box.querySelectorAll('[data-favr]').forEach(b => b.onclick = async () => {
-    const [host, port] = b.dataset.favr.split(':');
-    state.favorites = await window.api.favToggle({ host, port: +port });
-    renderDevices(); renderFavorites();
+  box.querySelectorAll('[data-favr]').forEach(b => b.onclick = () => {
+    const item = f.find(v => v.host + ':' + v.port === b.dataset.favr);
+    toggleFavorite(b.dataset.favr, item && item.model);
   });
   box.querySelectorAll('[data-copy]').forEach(el => el.onclick = () => copyText(el.dataset.copy));
 }
@@ -798,16 +963,26 @@ $('#adb-banner-link').onclick = (e) => { e.preventDefault(); goPage('settings');
 $('#btn-ad-tools').onclick = () => goPage('tools');
 $('#btn-ad-info').onclick = () => { if (activeSerial) openDevInfo(activeSerial); };
 $('#btn-ad-disc').onclick = async () => {
-  if (!activeSerial) return;
+  if (!activeSerial) return snack('Нет активного устройства');
   const ser = activeSerial;
+  if (isMtpSerial(ser)) {
+    mtpDeselected = true;
+    setActive(null);
+    snack('MTP-устройство убрано из активных. Кабель и режим передачи файлов можно отключить вручную.');
+    refreshDevices();
+    return;
+  }
   const r = await window.api.adbDisconnect(ser).catch(() => ({ ok: false, message: 'не удалось отключить' }));
   // отключаем и mDNS-дубль активного устройства
-  const mdns = (devices || []).find(d => d.serial !== ser && /^adb-.*\._tcp/.test(d.serial));
-  if (mdns) await window.api.adbDisconnect(mdns.serial).catch(() => null);
-  activeSerial = null;
+  if (String(ser).includes(':')) {
+    const mdns = (devices || []).find(d => d.serial !== ser && /^adb-.*\._tcp/.test(d.serial));
+    if (mdns) await window.api.adbDisconnect(mdns.serial).catch(() => null);
+  }
+  if (!String(ser).includes(':') && r) { r.ok = true; r.message = ''; }
+  setActive(null);
   _activeMiss = 0;
   invalidateAppsCache();
-  snack(r.message || (r.ok ? 'Отключено' : 'Отключено'));
+  snack(r && r.ok ? (r.message || 'Отключено') : 'Устройство уже не в сети — убрано из активных');
   refreshDevices();
 };
 $('#ad-serial').onclick = () => copyText($('#ad-serial').textContent);
@@ -816,17 +991,23 @@ $('#ad-serial').onclick = () => copyText($('#ad-serial').textContent);
 function renderScanResults() {
   const box = $('#scan-results');
   if (!scanFound.length) {
-    box.innerHTML = '<div class="empty">В локальной сети не найдено ни открытого порта 5555, ни mDNS-сервисов беспроводной отладки. Смотрите подсказку ниже.</div>';
+    box.innerHTML = '<div class="empty">В локальной сети и по USB ничего не найдено. Если телефон подключён кабелем, но отладка выключена, он появится как USB (MTP): только обмен файлами.</div>';
     return;
   }
   box.innerHTML = scanFound.map((f, i) => {
+    if (f.usb) {
+      return `<div class="list-row">
+        <span class="scan-ico" data-tip="USB · только файловый обмен">${CONN_ICONS.usb}</span>
+        <span class="mono grow2"><b>${esc(f.name || 'Android USB')}</b> <span class="muted">· USB · только файловый обмен · ADB-функции недоступны</span><br><span class="muted small mono">${esc(f.id || '')}</span></span>
+        <button class="btn btn-tonal btn-sm" data-usbopen="${esc(f.name || '')}" data-tip="Открыть файлы в программе. В этом режиме доступен только обмен файлами: ADB-функции, установка и управление приложениями недоступны.">Открыть файлы</button>
+      </div>`;
+    }
     // значок способа обнаружения — сразу видно, откуда взялось устройство
     const lbl = String(f.label || 'порт 5555');
     const ico = /mDNS/i.test(lbl) ? '&#128225;'          // 📡 mDNS-обнаружение
       : /истори/i.test(lbl) ? '&#128337;'               // 🕘 из истории
       : /избран/i.test(lbl) ? '&#11088;'                // ⭐ избранное
-      : /порт/i.test(lbl) ? '&#128268;'                 // 🔌 свип портов 5555
-      : '&#127760;';                                    // 🌐 сеть
+      : '&#127760;';                                    // 🌐 сеть / открытый порт
     return `<div class="list-row">
       <span class="scan-ico" data-tip="${esc(lbl)}">${ico}</span>
       <span class="mono grow2">${f.model ? '<b>' + esc(f.model) + '</b> · ' : ''}${esc(f.host)}:${esc(f.port)} <span class="muted">· ${esc(lbl)}${f.sid ? ' · ' + esc(f.sid) : ''}${f.model ? '' : ' · имя появится после подключения'}</span></span>
@@ -837,19 +1018,264 @@ function renderScanResults() {
     const f = scanFound[+b.dataset.sc];
     doConnect(f.host, f.port);
   });
+  box.querySelectorAll('[data-usbopen]').forEach(b => b.onclick = () => openMtpBrowser(b.dataset.usbopen));
 }
+
+/* ---------- встроенный MTP-браузер (Android без ADB) ---------- */
+let mtpState = { device: '', path: [] };
+function mtpPathText() { return '/' + mtpState.path.join('/'); }
+function mtpErrMsg(r) {
+  const e = String((r && r.error) || 'ошибка');
+  if (e === 'DEVICE_NOT_FOUND') return 'Устройство не найдено. Подключите кабель и включите режим MTP/передачи файлов.';
+  if (e === 'PATH_NOT_FOUND') return 'Папка не найдена — обновите список.';
+  if (e === 'FILE_NOT_FOUND') return 'Файл не найден — обновите список.';
+  if (e === 'COPY_TIMEOUT') return 'Не удалось скопировать: устройство не ответило.';
+  if (e === 'LOCAL_NOT_FOUND') return 'Локальный файл не найден.';
+  if (e === 'DELETE_TIMEOUT') return 'Подтвердите удаление на телефоне — операция ещё выполняется.';
+  return e;
+}
+function fsLoadingHtml(text) {
+  return '<div class="empty fs-loading">' + esc(text || 'Читаю папку') +
+    '<span class="fs-loading-dots"><span></span><span></span><span></span></span></div>';
+}
+async function openMtpBrowser(device) {
+  const name = String(device || '');
+  if (!name) return;
+  if (!mtpDevices.some(u => u.name === name)) mtpDevices.push({ name });
+  setFsListMode();
+  setActive('mtp:' + name);
+  goPage('files');
+  mtpFsRender();
+}
+/* MTP в том же файловом менеджере: #fs-list, быстрые папки, вид «список/значки» */
+let mtpInlineState = { device: '', path: [], loaded: false, viewInit: false };
+let mtpHist = [], mtpFwd = [];
+function mtpPathText() { return '/' + mtpInlineState.path.join('/'); }
+function mtpButtons() {
+  const b = $('#btn-fs-back'), f = $('#btn-fs-fwd');
+  if (b) b.disabled = !mtpHist.length;
+  if (f) f.disabled = !mtpFwd.length;
+}
+function hideMtpInline() {
+  const sec = $('#mtp-inline'); if (sec) sec.classList.add('hidden');
+  const card = $('#fs-card'); if (card) card.classList.remove('hidden');
+  const crumb = $('#fs-crumb'); if (crumb) crumb.classList.remove('hidden');
+  const mk = $('#btn-fs-mkdir'); if (mk) mk.disabled = false;
+  const nf = $('#btn-fs-newfile'); if (nf) nf.disabled = false;
+}
+function mtpNavigate(path, { back, fwd } = {}) {
+  if (back || fwd) {
+    const stack = back ? mtpHist : mtpFwd;
+    const other = back ? mtpFwd : mtpHist;
+    const prev = stack.pop();
+    if (prev == null) return;
+    other.push(mtpPathText());
+    mtpInlineState.path = prev.split('/').filter(Boolean);
+    mtpButtons();
+    mtpFsRender();
+    return;
+  }
+  const target = String(path || '/').startsWith('/') ? String(path || '/') : '/' + String(path || '');
+  const cur = mtpPathText();
+  if (target !== cur) {
+    mtpHist.push(cur);
+    if (mtpHist.length > 60) mtpHist.shift();
+    mtpFwd = [];
+  }
+  mtpInlineState.path = target.split('/').filter(Boolean);
+  mtpButtons();
+  mtpFsRender();
+}
+async function mtpFsRender() {
+  const name = mtpNameOf(activeSerial);
+  if (!name) return;
+  hideMtpInline();
+  const box = $('#fs-list'), empty = $('#fs-empty');
+  fsCatKind = null;
+  fsDir = '/' + mtpInlineState.path.join('/');
+  if (fsDir === '') fsDir = '/';
+  $('#fs-path').value = fsDir;
+  $('#fs-crumb').textContent = 'MTP · ' + name + ' · ' + fsDir;
+  $('#fs-storage').textContent = 'USB MTP · только файловый обмен · ADB-функции недоступны';
+  $('#fs-sysvol').innerHTML = '';
+  const mk = $('#btn-fs-mkdir'), nf = $('#btn-fs-newfile');
+  if (mk) mk.disabled = true;
+  if (nf) nf.disabled = true;
+  renderFsQuick();
+  box.classList.remove('hidden');
+  empty.classList.add('hidden');
+  box.innerHTML = fsLoadingHtml('Читаю папку');
+  const r = await window.api.mtpList(name, mtpInlineState.path).catch(e => ({ ok: false, error: e.message }));
+  if (!r || !r.ok) { box.innerHTML = '<div class="empty">' + esc(mtpErrMsg(r)) + '</div>'; return; }
+  const items = r.items || [];
+  if (!items.length) { box.innerHTML = '<div class="empty">Папка пуста</div>'; return; }
+  if (!mtpInlineState.viewInit) { setFsListMode(); mtpInlineState.viewInit = true; }
+  const isList = fsView === 'list';
+  box.classList.toggle('fs-grid', !isList);
+  box.classList.toggle('fs-xl', fsView === 'xl');
+  box.style.setProperty('--fs-cell', (fsCellPxOf(fsSlider) || 110) + 'px');
+  box.innerHTML = items.map(it => {
+    const p = (fsDir.replace(/\/+$/, '') || '') + '/' + it.name;
+    const ico = window.FSICONS.iconFor(it.name, it.dir).src;
+    if (isList) {
+      return `<div class="list-row fs-row" data-mtp-path="${esc(p)}" data-mtp-dir="${it.dir ? 1 : 0}">
+        <span class="fs-ico-wrap"><img class="fs-ico" src="${ico}" alt=""></span>
+        <span class="mono grow2 fs-name">${esc(it.name)}</span>
+        ${it.dir ? '<span class="muted small">папка</span>' : `<button class="btn btn-text btn-sm" data-mtp-dl="${esc(it.name)}">Скачать</button>`}
+      </div>`;
+    }
+    return `<div class="fs-cell" data-mtp-path="${esc(p)}" data-mtp-dir="${it.dir ? 1 : 0}">
+      <span class="fs-cell-pic"><img class="fs-cell-ico" src="${ico}" alt=""></span>
+      <span class="fs-cell-name">${esc(it.name)}</span>
+      ${it.dir ? '' : `<button class="btn btn-text btn-sm" data-mtp-dl="${esc(it.name)}">Скачать</button>`}
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-mtp-path]').forEach(el => el.onclick = (e) => {
+    if (e.target.closest('button')) return;
+    mtpNavigate(el.dataset.mtpPath);
+  });
+  box.querySelectorAll('[data-mtp-dl]').forEach(b => b.onclick = async () => {
+    $('#fs-storage').textContent = 'Скачиваю «' + b.dataset.mtpDl + '»…';
+    const rr = await window.api.mtpSaveFile(name, mtpInlineState.path, b.dataset.mtpDl).catch(e => ({ ok: false, error: e.message }));
+    $('#fs-storage').textContent = !rr || !rr.ok ? (rr && rr.canceled ? 'USB MTP · только файловый обмен' : mtpErrMsg(rr)) : 'Сохранено: ' + rr.file;
+  });
+  $('#fs-storage').textContent = 'USB MTP · только файловый обмен · ' + items.length + ' ' + plural(items.length, 'объект', 'объекта', 'объектов');
+}
+async function showMtpInline(device, force) {
+  // совместимость со старым вызовом: теперь MTP живёт в общем списке файлов
+  if (device) mtpInlineState.userPath = null;
+  await mtpFsRender();
+}
+async function mtpInlineLoad() {
+  const box = $('#mtp-inline-list'), st = $('#mtp-inline-status');
+  $('#mtp-inline-path').textContent = mtpInlinePathText();
+  $('#mtp-inline-up').disabled = !mtpInlineState.path.length;
+  box.innerHTML = fsLoadingHtml('Читаю папку');
+  st.textContent = 'MTP: только обмен файлами. ADB-функции, установка и управление приложениями недоступны.';
+  const r = await window.api.mtpList(mtpInlineState.device, mtpInlineState.path).catch(e => ({ ok: false, error: e.message }));
+  if (!r || !r.ok) {
+    box.innerHTML = '<div class="empty">' + esc(mtpErrMsg(r)) + '</div>';
+    st.textContent = '';
+    return;
+  }
+  const items = r.items || [];
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">Папка пуста</div>';
+    mtpInlineState.loaded = true;
+    st.textContent = '0 объектов';
+    return;
+  }
+  box.innerHTML = items.map(it => `<div class="list-row">
+    <span class="scan-ico">${it.dir ? '&#128193;' : '&#128196;'}</span>
+    <span class="mono grow2">${esc(it.name)}</span>
+    ${it.dir
+      ? `<button class="btn btn-tonal btn-sm" data-mtp-inline-folder="${esc(it.name)}">Открыть</button>`
+      : `<button class="btn btn-text btn-sm" data-mtp-inline-open="${esc(it.name)}">Открыть</button><button class="btn btn-text btn-sm" data-mtp-inline-save="${esc(it.name)}">Скачать</button><button class="btn btn-text btn-sm" data-mtp-inline-del="${esc(it.name)}">Удалить</button>`}
+  </div>`).join('');
+  box.querySelectorAll('[data-mtp-inline-folder]').forEach(b => b.onclick = () => {
+    mtpInlineState.path.push(b.dataset.mtpInlineFolder);
+    mtpInlineLoad();
+  });
+  box.querySelectorAll('[data-mtp-inline-open]').forEach(b => b.onclick = async () => {
+    st.textContent = 'Скачиваю и открываю «' + b.dataset.mtpInlineOpen + '»…';
+    const rr = await window.api.mtpOpenFile(mtpInlineState.device, mtpInlineState.path, b.dataset.mtpInlineOpen).catch(e => ({ ok: false, error: e.message }));
+    if (!rr || !rr.ok) return st.textContent = mtpErrMsg(rr);
+    st.textContent = 'Открыто: ' + (rr.name || b.dataset.mtpInlineOpen);
+  });
+  box.querySelectorAll('[data-mtp-inline-save]').forEach(b => b.onclick = async () => {
+    st.textContent = 'Скачиваю «' + b.dataset.mtpInlineSave + '»…';
+    const rr = await window.api.mtpSaveFile(mtpInlineState.device, mtpInlineState.path, b.dataset.mtpInlineSave).catch(e => ({ ok: false, error: e.message }));
+    if (!rr || !rr.ok) return st.textContent = rr && rr.canceled ? '' : mtpErrMsg(rr);
+    st.textContent = 'Сохранено: ' + rr.file;
+  });
+  box.querySelectorAll('[data-mtp-inline-del]').forEach(b => b.onclick = async () => {
+    const name = b.dataset.mtpInlineDel;
+    const yes = await uiConfirm('Удаление с устройства', 'Удалить «' + name + '»? На телефоне может потребоваться подтверждение.');
+    if (!yes || !yes.ok) return;
+    st.textContent = 'Удаляю «' + name + '»…';
+    const rr = await window.api.mtpDelete(mtpInlineState.device, mtpInlineState.path, name).catch(e => ({ ok: false, error: e.message }));
+    if (rr && rr.ok) { snack('Удалено: ' + name); await mtpInlineLoad(); return; }
+    if (rr && rr.pending) { snack('Подтвердите удаление на телефоне', 8000); setTimeout(mtpInlineLoad, 3000); return; }
+    st.textContent = mtpErrMsg(rr);
+  });
+  mtpInlineState.loaded = true;
+  st.textContent = items.length + ' ' + plural(items.length, 'объект', 'объекта', 'объектов');
+}
+$('#mtp-inline-up').onclick = () => { if (mtpInlineState.path.length) { mtpInlineState.path.pop(); mtpInlineLoad(); } };
+$('#mtp-inline-refresh').onclick = () => mtpInlineLoad();
+$('#mtp-inline-upload').onclick = async () => {
+  const st = $('#mtp-inline-status');
+  st.textContent = 'Выберите файл на компьютере…';
+  const r = await window.api.mtpUpload(mtpInlineState.device, mtpInlineState.path).catch(e => ({ ok: false, error: e.message }));
+  if (!r || !r.ok) { st.textContent = r && r.canceled ? '' : mtpErrMsg(r); return; }
+  snack('Загружено: ' + r.name);
+  await mtpInlineLoad();
+};
+async function mtpLoad() {
+  const box = $('#mtp-list'), st = $('#mtp-status');
+  $('#mtp-path').textContent = mtpPathText();
+  $('#mtp-up').disabled = !mtpState.path.length;
+  box.innerHTML = fsLoadingHtml('Читаю папку');
+  st.textContent = 'Это MTP-доступ: только обмен файлами, ADB-функции недоступны.';
+  const r = await window.api.mtpList(mtpState.device, mtpState.path).catch(e => ({ ok: false, error: e.message }));
+  if (!r || !r.ok) {
+    box.innerHTML = '<div class="empty">' + esc(mtpErrMsg(r)) + '</div>';
+    st.textContent = '';
+    return;
+  }
+  const items = r.items || [];
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">Папка пуста</div>';
+    st.textContent = '0 объектов';
+    return;
+  }
+  box.innerHTML = items.map(it => `<div class="list-row">
+    <span class="scan-ico">${it.dir ? '&#128193;' : '&#128196;'}</span>
+    <span class="mono grow2">${esc(it.name)}</span>
+    ${it.dir
+      ? `<button class="btn btn-tonal btn-sm" data-mtp-folder="${esc(it.name)}">Открыть</button>`
+      : `<button class="btn btn-text btn-sm" data-mtp-open="${esc(it.name)}">Открыть</button><button class="btn btn-text btn-sm" data-mtp-save="${esc(it.name)}">Скачать</button>`}
+  </div>`).join('');
+  box.querySelectorAll('[data-mtp-folder]').forEach(b => b.onclick = () => {
+    mtpState.path.push(b.dataset.mtpFolder);
+    mtpLoad();
+  });
+  box.querySelectorAll('[data-mtp-open]').forEach(b => b.onclick = async () => {
+    st.textContent = 'Скачиваю и открываю «' + b.dataset.mtpOpen + '»…';
+    const rr = await window.api.mtpOpenFile(mtpState.device, mtpState.path, b.dataset.mtpOpen).catch(e => ({ ok: false, error: e.message }));
+    if (!rr || !rr.ok) return st.textContent = mtpErrMsg(rr);
+    st.textContent = 'Открыто: ' + (rr.name || b.dataset.mtpOpen);
+  });
+  box.querySelectorAll('[data-mtp-save]').forEach(b => b.onclick = async () => {
+    st.textContent = 'Скачиваю «' + b.dataset.mtpSave + '»…';
+    const rr = await window.api.mtpSaveFile(mtpState.device, mtpState.path, b.dataset.mtpSave).catch(e => ({ ok: false, error: e.message }));
+    if (!rr || !rr.ok) return st.textContent = rr && rr.canceled ? '' : mtpErrMsg(rr);
+    st.textContent = 'Сохранено: ' + rr.file;
+  });
+  st.textContent = items.length + ' ' + plural(items.length, 'объект', 'объекта', 'объектов');
+}
+$('#mtp-up').onclick = () => { if (mtpState.path.length) { mtpState.path.pop(); mtpLoad(); } };
+$('#mtp-refresh').onclick = () => mtpLoad();
+$('#mtp-upload').onclick = async () => {
+  const st = $('#mtp-status');
+  st.textContent = 'Выберите файл на компьютере…';
+  const r = await window.api.mtpUpload(mtpState.device, mtpState.path).catch(e => ({ ok: false, error: e.message }));
+  if (!r || !r.ok) { st.textContent = r && r.canceled ? '' : mtpErrMsg(r); return; }
+  snack('Загружено: ' + r.name);
+  await mtpLoad();
+};
 
 $('#btn-scan').onclick = async () => {
   $('#scan-card').classList.remove('hidden');
   $('#scan-card').classList.remove('scanning-done');
   $('#scan-progress').classList.remove('hidden');
-  $('#scan-title').textContent = 'Сканирование локальной сети…';
+  $('#scan-title').textContent = 'Поиск устройств (сеть + USB)…';
   $('#scan-results').innerHTML = '';
   $('#scan-bar').style.width = '0%';
   $('#scan-progress-text').textContent = '0%';
   scanFound = [];
   const found = await window.api.scanSubnet();
-  scanFound = (found || []).map(x => ({ host: x.host, port: x.port, label: x.label || 'порт 5555', sid: x.sid, model: x.model || null }));
+  scanFound = (found || []).map(x => ({ host: x.host, port: x.port, label: x.label || (x.usb ? 'USB (MTP)' : 'порт 5555'), sid: x.sid, model: x.model || null, usb: !!x.usb, name: x.name || '', id: x.id || '', status: x.status || '', cls: x.cls || '' }));
   renderScanResults();
 };
 
@@ -956,7 +1382,7 @@ $('#btn-qr-show').onclick = () => { if (qrActive) { window.api.qrCancel(); } qrB
 $('#btn-qr-cancel-inline').onclick = () => { window.api.qrCancel(); qrHidePanel(); };
 
 /* ---------- инструменты: состояние и общие ---------- */
-function currentSerial() { return activeSerial; }
+function currentSerial() { return isMtpSerial(activeSerial) ? null : activeSerial; }
 function updateToolsState() {
   const ok = !!activeSerial;
   $$('#tools-grid .btn, #tools-grid .chip').forEach(b => {
@@ -1446,7 +1872,7 @@ window.api.onLogcat(lines => {
 });
 
 /* ---------- терминал: библиотека команд + свои команды + автодополнение (F16/F17) ---------- */
-let shellOn = false;
+let shellOn = false, shellSerial = null;
 const shellHist = []; let shellHistIdx = -1;
 const ERR_RE = /\b(error|failed|failure|exception|not found|denied|invalid|unable|cannot|no such)\b/i;
 function appendShell(text) {
@@ -1460,11 +1886,25 @@ function appendShell(text) {
   while (v.children.length > 1500) v.removeChild(v.firstChild);
   v.scrollTop = v.scrollHeight;
 }
-window.api.onShellOut(t => appendShell(t));
+window.api.onShellOut(ev => {
+  if (typeof ev === 'string') { appendShell(ev); return; }
+  if (!ev || !shellOn || ev.serial !== shellSerial) return;
+  appendShell(ev.data || '');
+});
 $('#btn-shell-toggle').onclick = async () => {
   const s = currentSerial(); if (!s) return snack('Нет подключённого устройства');
-  if (shellOn) { await window.api.shellStop(); shellOn = false; $('#shell-view').textContent += '\n[сессия остановлена]\n'; }
-  else { await window.api.shellStart(s); shellOn = true; $('#shell-view').textContent = '[сессия adb shell запущена]\n'; }
+  if (shellOn) {
+    await window.api.shellStop();
+    shellOn = false;
+    shellSerial = null;
+    $('#shell-view').textContent += '\n[сессия остановлена]\n';
+  } else {
+    const r = await window.api.shellStart(s);
+    if (!r || !r.ok) return snack('Не удалось запустить adb shell');
+    shellSerial = s;
+    shellOn = true;
+    $('#shell-view').textContent = '[сессия adb shell запущена]\n';
+  }
 };
 function shellSend() {
   const inp = $('#shell-input');
@@ -1615,7 +2055,7 @@ let mirrorCarry = new Uint8Array(0);
 let mirrorSPS = null, mirrorPPS = null, mirrorDev = null, mirrorWaitingKey = false;
 let mirrorFrames = 0, mirrorFpsLast = 0, mirrorFpsTimer = null, mirrorJpegSeq = 0;
 let mirrorFpsLastSeen = 0, mirrorFpsSeenAt = 0;   // последний ненулевой FPS
-let mirrorStallHandled = false, mirrorBlackRun = 0, mirrorGen = 0;
+let mirrorStallHandled = false, mirrorBlackRun = 0, mirrorGen = 0, mirrorStartSeq = 0;
 // лестница декодера — жалоба «данные идут, но ни одного кадра не выдано»: на части
 // машин аппаратный декодер WebCodecs молча не выдаёт кадры. Раньше мы сразу уезжали в
 // снимки экрана; теперь пробуем ступени: 0 — avcC (как было), 1 — Annex-B без description,
@@ -1834,9 +2274,13 @@ window.api.onMirrorJpeg(frame => {
 });
 
 async function startMirror(serial, mode) {
+  const seq = ++mirrorStartSeq;
   mirrorMode = mode || 'h264';
   mirrorDev = (infoCache[serial] && infoCache[serial].info) || null;
-  if (!mirrorDev) { try { mirrorDev = (await window.api.devInfo(serial)); } catch (e) {} }
+  if (!mirrorDev) {
+    try { mirrorDev = (await window.api.devInfo(serial)); } catch (e) {}
+    if (seq !== mirrorStartSeq) return;
+  }
   mirrorOn = true; mirrorSPS = mirrorPPS = null; mirrorPts = 0; mirrorCarry = new Uint8Array(0);
   mirrorWaitingKey = false; mirrorStallHandled = false; mirrorBlackRun = 0;
   mirrorFrames = 0; mirrorFpsLast = 0; mirrorJpegSeq = 0;
@@ -1855,10 +2299,12 @@ async function startMirror(serial, mode) {
   mirrorFpsTick._t = Date.now();
   mirrorFpsTimer = setInterval(mirrorFpsTick, 1000);
   const r = await window.api.mirrorStart(serial, mirrorMode);
+  if (seq !== mirrorStartSeq) return;
   if (!r.ok) { snack(r.error || 'Не удалось начать трансляцию'); mirrorStopUI(); }
   else mirrorGen = (r.gen != null) ? r.gen : mirrorGen + 1;
 }
 function mirrorStopUI(silent) {
+  mirrorStartSeq++;
   mirrorOn = false;
   mirrorGen = -1; // маркер «сессии нет»: поздний mirror-stopped от старой сессии не убьёт новую
   mirrorCarry = new Uint8Array(0);
@@ -1923,7 +2369,7 @@ function renderApkTargets() {
   const sel = $('#apk-target');
   const online = onlineDevices();
   sel.innerHTML = online.length
-    ? online.map(d => `<option value="${esc(d.serial)}">${esc(d.friendly || d.model || d.serial)}${isUsb(d.serial) ? ' [USB]' : ''}</option>`).join('')
+    ? online.map(d => `<option value="${esc(d.serial)}">${esc(d.friendly || d.model || d.serial)}${isUsb(d.serial) ? ' [USB ADB]' : ' [ADB]'}</option>`).join('')
     : '<option value="">Нет подключённых устройств</option>';
   if (activeSerial && online.some(d => d.serial === activeSerial)) sel.value = activeSerial;
   // мини-окно установки — тот же список
@@ -2193,6 +2639,11 @@ let fsHist = [];            // история переходов для кноп
 let fsItems = [];           // кэш последнего списка — для просмотрщика/плеера/флешки
 let fsFlash = null;         // путь смонтированной OTG-флешки (/storage/XXXX-XXXX) или null
 let fsCatKind = null;       // категория «со всех папок» (photo/music/video/docs) или null
+let fsCatCounts = {};
+let fsCatCache = {};
+let fsCatCountsSerial = null;
+let fsCatCountsTs = 0;
+let fsCatCountsLoading = false;
 let fsCatItems = [];        // результаты категории (полные пути)
 // буфер обмена проводника — Копировать/Вырезать → Вставить в любую папку
 // (в т.ч. с памяти телефона на флешку и обратно)
@@ -2222,6 +2673,20 @@ function fsNormalize(p) {
 }
 function renderFsQuick() {
   const box = $('#fs-quick');
+  if (isMtpSerial(activeSerial)) {
+    const q = [
+      { label: 'Внутренняя память', dir: '/Внутренняя память' },
+      { label: 'Загрузки', dir: '/Внутренняя память/Download' },
+      { label: 'DCIM', dir: '/Внутренняя память/DCIM' },
+      { label: 'Pictures', dir: '/Внутренняя память/Pictures' },
+      { label: 'Movies', dir: '/Внутренняя память/Movies' },
+      { label: 'Music', dir: '/Внутренняя память/Music' }
+    ];
+    box.innerHTML = q.map(x => `<button class="chip${fsDir === x.dir ? ' view-chip active' : ''}" data-mtp-qdir="${esc(x.dir)}">${esc(x.label)}</button>`).join('') +
+      '<span class="muted small">MTP · только файлы</span>';
+    box.querySelectorAll('[data-mtp-qdir]').forEach(b => b.onclick = () => mtpNavigate(b.dataset.mtpQdir));
+    return;
+  }
   const catChips = [
     { kind: 'photo', label: 'Все фото', ico: '&#128444;' },
     { kind: 'music', label: 'Вся музыка', ico: '&#9835;' },
@@ -2231,7 +2696,35 @@ function renderFsQuick() {
   box.innerHTML = FS_QUICK.map(q => `<button class="chip${fsCatKind ? '' : (fsDir === q.dir ? ' view-chip active' : '')}" data-qdir="${esc(q.dir)}">${esc(q.label)}</button>`).join('') +
     catChips.map(c => `<button class="chip${fsCatKind === c.kind ? ' view-chip active' : ''}" data-qcat="${c.kind}" data-tip="Показать ${esc(c.label.toLowerCase())} СО ВСЕХ папок телефона">${c.ico} ${esc(c.label)}</button>`).join('');
   box.querySelectorAll('[data-qdir]').forEach(b => b.onclick = () => fsNavigate(b.dataset.qdir));
-  box.querySelectorAll('[data-qcat]').forEach(b => b.onclick = () => fsNavigate('cat:' + b.dataset.qcat));
+  box.querySelectorAll('[data-qcat]').forEach(b => {
+    const kind = b.dataset.qcat;
+    const n = fsCatCounts[kind];
+    const suffix = fsCatCountsLoading ? ' (…)' : (n == null ? '' : ` (${n})`);
+    if (suffix) b.append(suffix);
+    b.onclick = () => fsNavigate('cat:' + kind);
+  });
+}
+async function loadFsCatCounts(force) {
+  if (isMtpSerial(activeSerial)) return;
+  const s = currentSerial();
+  if (!s) return;
+  const fresh = fsCatCountsSerial === s && fsCatCountsTs && Date.now() - fsCatCountsTs < 120000;
+  if (!force && fresh) return;
+  if (fsCatCountsLoading && fsCatCountsSerial === s) return;
+  fsCatCountsSerial = s;
+  fsCatCounts = {};
+  fsCatCountsTs = 0;
+  fsCatCountsLoading = true;
+  renderFsQuick();
+  let r = null;
+  try { r = await window.api.fsCounts(s); } catch (e) {}
+  if (activeSerial !== s) return;
+  if (r && r.ok && r.counts) {
+    fsCatCounts = r.counts;
+    fsCatCountsTs = Date.now();
+  }
+  fsCatCountsLoading = false;
+  renderFsQuick();
 }
 // ОДНА кнопка «Вид» с выпадающим меню как в Проводнике Windows 11 — пункты + ползунок
 // размера значков. ВАЖНО: в здесь был crash-баг всего приложения: IIFE syncFsViewChips
@@ -2252,6 +2745,13 @@ function fsCellPxOf(v) {
   return Math.round(130 + (v - 67) / 33 * 120);              // 130..250
 }
 const VIEW_NAMES = { list: 'Список', icons: 'Значки', xl: 'Огромные' };
+function setFsListMode() {
+  fsSlider = 0;
+  try { localStorage.setItem('fs.slider', '0'); } catch (e) {}
+  const r = $('#fs-view-range'); if (r) r.value = '0';
+  fsView = 'list';
+  try { syncFsViewUI(); } catch (e) {}
+}
 function syncFsViewUI() {
   fsView = fsSliderViewOf(fsSlider);
   const name = $('#fs-view-name'); if (name) name.textContent = VIEW_NAMES[fsView];
@@ -2286,6 +2786,11 @@ const CAT_TITLES = { photo: 'Все фото устройства', music: 'Вс
 let fsFwd = [];   // история «Вперёд» (боковые кнопки мыши, как в Проводнике)
 function fsCurToken() { return fsCatKind ? 'cat:' + fsCatKind : fsDir; }
 function fsNavigate(newDir, { back, fwd } = {}) {
+  if (isMtpSerial(activeSerial)) {
+    if (back || fwd) { mtpNavigate(null, { back, fwd }); return; }
+    if (newDir && !String(newDir).startsWith('cat:')) mtpNavigate(newDir);
+    return;
+  }
   if (newDir && String(newDir).startsWith('cat:')) {
     const kind = String(newDir).slice(4);
     if (!CAT_TITLES[kind]) return;
@@ -2570,6 +3075,9 @@ async function fsDeletePath(name, path) {
   if (r && r.ok) {
     // файл просто исчезает из списка, без полной перерисовки
     fsRemovePathsFromList([path]);
+    fsCatCache = {};
+    fsCatCounts = {};
+    renderFsQuick();
     snack('Удалено: ' + name);
     return true;
   }
@@ -2592,6 +3100,8 @@ async function fsUploadLocalPaths(paths, dir) {
   return ok;
 }
 async function fsRender(opts) {
+  if (isMtpSerial(activeSerial)) { mtpFsRender(); return; }
+  hideMtpInline();
   opts = opts || {};
   const seq = ++fsSeq;
   // сбрасываем очереди миниатюр/иконок ПРОШЛОЙ папки — иначе догоняющие задачи
@@ -2607,7 +3117,7 @@ async function fsRender(opts) {
   // РЕЖИМ КАТЕГОРИИ — «Все фото / Вся музыка / Всё видео / Документы» со ВСЕХ папок
   if (fsCatKind) {
     $('#fs-path').value = CAT_TITLES[fsCatKind] || fsCatKind;
-    $('#fs-crumb').textContent = CAT_TITLES[fsCatKind] + ' (виртуальная папка — файлы лежат по своим местам)';
+    $('#fs-crumb').textContent = CAT_TITLES[fsCatKind] || fsCatKind;
     if (!s) { box.innerHTML = ''; box.classList.add('hidden'); empty.classList.remove('hidden'); return; }
     if (seq !== fsSeq) return;
     empty.classList.add('hidden');
@@ -2617,10 +3127,25 @@ box.classList.remove('fs-grid', 'fs-xl');
     box.innerHTML = `<div class="fs-radar-wrap"><div class="fs-radar"></div><div class="fs-radar-txt">Ищу файлы по всему телефону…</div></div>`;
     // roots не задаём — main сам берёт РЕАЛЬНЫЕ хранилища (/storage/emulated/0, SD)
     // и ищет с find -H, иначе симлинк /sdcard не обходится и список пустой
-    const r = await window.api.fsSearch(s, fsCatKind, null).catch(() => null);
-    if (seq !== fsSeq) return;
-    fsCatItems = (r && r.items) || [];
-    fsItems = fsCatItems;
+    const cachedCat = fsCatCache[fsCatKind];
+    let r = null;
+    if (cachedCat) {
+      fsCatItems = cachedCat.items || [];
+      fsCatCounts[fsCatKind] = cachedCat.total;
+      fsItems = fsCatItems;
+      renderFsQuick();
+    } else {
+      r = await window.api.fsSearch(s, fsCatKind, null).catch(() => null);
+      if (seq !== fsSeq) return;
+      fsCatItems = (r && r.items) || [];
+      fsItems = fsCatItems;
+      if (r && r.ok) {
+        const total = Number(r.total != null ? r.total : fsCatItems.length) || 0;
+        fsCatCounts[fsCatKind] = total;
+        fsCatCache[fsCatKind] = { items: fsCatItems, total };
+        renderFsQuick();
+      }
+    }
     const q2 = ($('#fs-filter').value || '').toLowerCase();
     let items2 = fsCatItems;
     if (q2) items2 = items2.filter(it => it.name.toLowerCase().includes(q2));
@@ -2727,7 +3252,9 @@ box.classList.remove('fs-grid', 'fs-xl');
   // синхронизируем, чтобы крошки и операции работали по настоящему пути
   if (r.path && r.path !== fsDir) { fsDir = r.path; $('#fs-path').value = fsDir; $('#fs-crumb').textContent = fsDir; }
   if (!r.ok) {
-    box.innerHTML = '<div class="empty">Не удалось открыть папку: ' + esc(r.error || '') + '</div>';
+    const msg = String(r.error || 'ошибка');
+    const friendly = /^(Нет доступа|Раздел )/i.test(msg);
+    box.innerHTML = '<div class="empty">' + (friendly ? esc(msg) : 'Не удалось открыть папку: ' + esc(msg)) + '</div>';
     try { window.api.uiLog('fs:list ' + fsDir + ' → ' + (r.error || 'ошибка')); } catch (e) {}
     return;
   }
@@ -2923,7 +3450,8 @@ function openFsContextMenu(x, y, it, act) {
   const isArc = !it.dir && ARC_RE.test(it.name);
   const isApk = !it.dir && APK_RE.test(it.name);
   const p = act.path;
-items.push({ t: it.dir ? '&#128449; Открыть папку' : '&#128196; Открыть', fn: act.open });
+  items.push({ t: it.dir ? '&#128449; Открыть папку' : '&#128196; Открыть', fn: act.open });
+  if (isApk) items.push({ t: '&#128242; Установить на устройство', fn: () => fsInstallApk(it, p) });
   // «слушать фоном» — аудио играет в левой панели, пока ходишь по другим разделам
   if (!it.dir && AUD_RE.test(it.name)) items.push({ t: '&#9835; Слушать фоном', fn: () => rmPlayFull(p) });
   if (act.reveal) items.push({ t: '&#128194; Открыть расположение файла', fn: act.reveal });
@@ -3067,6 +3595,30 @@ function fsBatchUpdate() {
 // передача выбранного на другой телефон. Выбор получателя и папки —
 // в отдельном диалоге; сами данные идут между телефонами, не через ПК.
 const ptCtx = { paths: [], src: null };
+let ptProgTimer = null, ptProgVal = 0, ptRunning = false;
+function ptSetProgress(v) {
+  ptProgVal = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+  const bar = $('#pt-progress-bar'), lab = $('#pt-progress-label');
+  if (bar) bar.style.width = ptProgVal + '%';
+  if (lab) lab.textContent = ptProgVal + '%';
+}
+function ptProgressReset() {
+  if (ptProgTimer) { clearInterval(ptProgTimer); ptProgTimer = null; }
+  ptSetProgress(0);
+}
+function ptProgressStart() {
+  ptProgressReset();
+  ptProgTimer = setInterval(() => {
+    if (ptProgVal < 90) {
+      const step = Math.max(1, Math.round((90 - ptProgVal) / 15));
+      ptSetProgress(ptProgVal + step);
+    }
+  }, 400);
+}
+function ptProgressDone() {
+  if (ptProgTimer) { clearInterval(ptProgTimer); ptProgTimer = null; }
+  ptSetProgress(100);
+}
 function ptOtherDevices() {
   return onlineDevices().filter(d => d.serial !== activeSerial);
 }
@@ -3083,25 +3635,42 @@ function ptOpen(paths) {
     paths.slice(0, 12).map(p => '<div class="mono small" style="word-break:break-all">' + esc(p) + '</div>').join('') +
     (paths.length > 12 ? '<div class="muted small">… и ещё ' + (paths.length - 12) + '</div>' : '');
   $('#pt-dest').value = '/sdcard/Download';
-  $('#pt-status').textContent = 'Данные пойдут напрямую по Wi-Fi между телефонами. Компьютер только запускает передачу.';
+  $('#pt-status').textContent = 'Данные пойдут напрямую по Wi-Fi между устройствами. Компьютер только запускает передачу.';
+  ptProgressReset();
   $('#btn-pt-start').disabled = false;
   openDlg('dlg-phonetransfer');
 }
 async function ptRun() {
-  if (!ptCtx.paths.length || !ptCtx.src) return;
+  if (!ptCtx.paths.length || !ptCtx.src || ptRunning) return;
+  ptRunning = true;
+  const btn = $('#btn-pt-start');
+  if (btn) btn.disabled = true;
   const dst = $('#pt-target').value;
   const dest = ($('#pt-dest').value || '').trim() || '/sdcard/Download';
-  if (!dst) return;
-  const btn = $('#btn-pt-start');
-  btn.disabled = true;
+  if (!dst) { ptRunning = false; if (btn) btn.disabled = false; return; }
+  let conflictMode = '';
+  try {
+    const listing = await window.api.fsList(dst, dest);
+    if (listing && listing.ok) {
+      const existing = new Set((listing.items || []).map(x => x.name));
+      const clashes = ptCtx.paths.map(p => p.split('/').pop()).filter(n => existing.has(n));
+      if (clashes.length) {
+        const choice = await uiConflict(clashes);
+        if (choice === 'cancel') { ptRunning = false; if (btn) btn.disabled = false; return; }
+        conflictMode = choice;
+      }
+    }
+  } catch (e) {}
+  ptProgressStart();
   $('#pt-status').textContent = 'Передаю ' + ptCtx.paths.length + ' объект(ов)… Не закрывайте программу.';
   try {
-    const r = await window.api.fsPhoneTransfer({ src: ptCtx.src, dst, paths: ptCtx.paths, dest });
+    const r = await window.api.fsPhoneTransfer({ src: ptCtx.src, dst, paths: ptCtx.paths, dest, conflict: conflictMode });
     const items = (r && r.items) || [];
     const okN = items.filter(x => x && x.ok).length;
-    if (r && r.ok) {
-      $('#pt-status').textContent = 'Готово: ' + okN + ' из ' + items.length + ' передано в ' + dest + ' на ' + dst + '.';
-      snack('Передано на ' + dst + ': ' + okN + ' из ' + items.length, 5000);
+    const allOk = items.length > 0 && okN === items.length;
+    if (allOk) {
+      $('#pt-status').textContent = 'Успешно: ' + okN + ' из ' + items.length + ' передано в ' + dest + ' на ' + dst + '.';
+      snack('Успешно передано: ' + okN + ' из ' + items.length, 5000);
       $$('#fs-list [data-fssel]').forEach(c => c.checked = false);
       fsBatchUpdate();
     } else {
@@ -3115,7 +3684,9 @@ async function ptRun() {
     $('#pt-status').textContent = 'Ошибка: ' + e.message;
     snack('Передача не удалась: ' + e.message, 6000);
   } finally {
-    btn.disabled = false;
+    ptRunning = false;
+    if (btn) btn.disabled = false;
+    ptProgressDone();
   }
 }
 document.addEventListener('change', e => {
@@ -3144,7 +3715,34 @@ $('#btn-fs-batch-phone').onclick = () => {
   if (!paths.length) return;
   ptOpen(paths);
 };
+let conflictResolve = null;
+function uiConflict(names) {
+  return new Promise(resolve => {
+    conflictResolve = resolve;
+    const shown = names.slice(0, 8).join(', ');
+    $('#conflict-body').textContent = 'На получателе уже есть: ' + shown + (names.length > 8 ? ' и ещё ' + (names.length - 8) : '') +
+      '. Заменить их или сохранить новые под другими именами?';
+    openDlg('dlg-conflict');
+  });
+}
+function conflictDone(choice) {
+  const r = conflictResolve; conflictResolve = null;
+  closeDlg('dlg-conflict');
+  if (r) r(choice);
+}
+$('#btn-conflict-replace').onclick = () => conflictDone('replace');
+$('#btn-conflict-rename').onclick = () => conflictDone('rename');
+$('#btn-conflict-cancel').onclick = () => conflictDone('cancel');
 $('#btn-pt-start').onclick = ptRun;
+$('#btn-pt-browse').onclick = () => {
+  const dst = $('#pt-target').value;
+  if (!dst) return snack('Сначала выберите получателя');
+  const start = ($('#pt-dest').value || '').trim() || '/sdcard/Download';
+  openFsPickDialog(dst, start, 'Папка на получателе', 'Выберите папку на устройстве «' + nameOf(dst) + '».', dest => {
+    $('#pt-dest').value = dest;
+    ptRun();
+  });
+};
 $('#btn-fs-batch-get').onclick = async () => {
   const s = currentSerial(); if (!s) return snack('Нет устройства');
   const paths = fsSelPaths().filter(p => {
@@ -3173,24 +3771,35 @@ $('#btn-fs-batch-del').onclick = async () => {
     const r = await window.api.fsCmd(s, ['rm', '-rf', p]);
     if (r.ok) { okN++; okPaths.push(p); }
   }
-  if (okPaths.length) fsRemovePathsFromList(okPaths);
+  if (okPaths.length) {
+    fsRemovePathsFromList(okPaths);
+    fsCatCache = {};
+    fsCatCounts = {};
+    renderFsQuick();
+  }
   snack('Удалено: ' + okN + ' из ' + paths.length);
   fsBatchUpdate();
 };
 
 
 /* ================= «Переместить в… / Копировать в…» — выбор папки назначения ======= */
-const fsm = { paths: [], move: true, dir: '/sdcard', resolve: null };
+const fsm = { paths: [], move: true, dir: '/sdcard', resolve: null, serial: null };
 function fsmRenderList() {
   const box = $('#fsm-list');
   box.innerHTML = '<div class="empty">Читаю папки…</div>';
-  window.api.fsList(currentSerial(), fsm.dir).then(r => {
+  window.api.fsList(fsm.serial || currentSerial(), fsm.dir).then(r => {
     if (!r.ok) { box.innerHTML = '<div class="empty">Не удалось открыть: ' + esc(r.error || '') + '</div>'; return; }
-    const dirs = (r.items || []).filter(x => x.dir);
+    const all = r.items || [];
+    const dirs = all.filter(x => x.dir);
+    const files = all.filter(x => !x.dir);
     $('#fsm-path').value = fsm.dir;
     box.innerHTML = dirs.map(d => `<div class="list-row" data-fsmd="${esc(d.name)}">
       <span class="fs-ico-wrap"><img class="fs-ico" src="${window.FSICONS.iconFor('', true).src}" alt=""></span>
-      <span class="grow2">${esc(d.name)}</span><span class="muted small">открыть</span></div>`).join('') || '<div class="empty">Вложенных папок нет</div>';
+      <span class="grow2">${esc(d.name)}</span><span class="muted small">открыть</span></div>`).join('') +
+      files.map(f => `<div class="list-row" style="opacity:.72;cursor:default">
+      <span class="fs-ico-wrap"><img class="fs-ico" src="${window.FSICONS.iconFor(f.name, false).src}" alt=""></span>
+      <span class="grow2 mono">${esc(f.name)}</span><span class="muted small">${fmtBytesLong(f.size || 0)}</span></div>`).join('') ||
+      '<div class="empty">Папка пуста</div>';
     box.querySelectorAll('[data-fsmd]').forEach(el => el.onclick = () => {
       fsm.dir = fsm.dir.replace(/\/+$/, '') + '/' + el.dataset.fsmd;
       fsmRenderList();
@@ -3199,10 +3808,21 @@ function fsmRenderList() {
 }
 function openFsMoveDialog(paths, move, firstName) {
   const s = currentSerial(); if (!s) return snack('Нет устройства');
-  fsm.paths = paths; fsm.move = !!move;
+  fsm.paths = paths; fsm.move = !!move; fsm.serial = s; fsm.resolve = null;
   fsm.dir = fsCatKind ? '/sdcard' : (fsFlash && (fsDir + '/').startsWith(fsFlash) ? fsFlash : '/sdcard');
   $('#fsm-title').textContent = move ? 'Переместить в…' : 'Копировать в…';
+  $('#btn-fsm-ok').textContent = 'СЮДА';
   $('#fsm-sub').textContent = (move ? 'Переместить' : 'Скопировать') + ' «' + (firstName || paths[0].split('/').pop()) + '» в выбранную папку. Папку можно открыть на любом томе (память/флешка).';
+  openDlg('dlg-fsmove');
+  fsmRenderList();
+}
+function openFsPickDialog(serial, startDir, title, sub, cb) {
+  if (!serial) return;
+  fsm.paths = []; fsm.move = false; fsm.serial = serial; fsm.resolve = cb;
+  fsm.dir = fsNormalize(startDir || '/sdcard/Download');
+  $('#fsm-title').textContent = title || 'Выбрать папку';
+  $('#fsm-sub').textContent = sub || '';
+  $('#btn-fsm-ok').textContent = 'Выбрать эту папку';
   openDlg('dlg-fsmove');
   fsmRenderList();
 }
@@ -3332,11 +3952,38 @@ $('#btn-arc-extract-sel').onclick = async () => {
 /* ================= ИНСТРУМЕНТЫ USB/OTG-ФЛЕШКИ ================================== */
 let usbVol = null;
 async function openUsbTools(vol) {
-  usbVol = vol;
-  openDlg('dlg-usbtools');
+  const s = currentSerial();
+  if (!s) return snack('Нет подключённого устройства');
+  const r = await window.api.fsVolumes(s).catch(() => null);
+  const ext = ((r && r.mounts) || []).filter(m => m && m.path && !/emulated/.test(m.path));
+  const base = (m) => String(m.path).split('/').pop();
+  const sel = $('#usb-vol-select');
+  if (sel) {
+    sel.innerHTML = ext.length ? ext.map(m => {
+      const b = base(m);
+      const nm = /^[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}$/.test(b) ? 'Флешка ' + b : 'SD-карта ' + b;
+      return `<option value="${esc(b)}">${esc(nm)} — /storage/${esc(b)}</option>`;
+    }).join('') : '<option value="">Флешка не найдена</option>';
+    sel.disabled = !ext.length;
+  }
+  const want = vol && ext.some(m => base(m) === vol) ? vol : (ext[0] ? base(ext[0]) : '');
+  usbVol = want || null;
+  if (sel) sel.value = usbVol || '';
+  const has = !!usbVol;
+  ['btn-usb-refresh', 'btn-usb-check', 'btn-usb-eject', 'btn-usb-label', 'btn-usb-format', 'btn-usb-fake'].forEach(id => {
+    const b = document.getElementById(id);
+    if (b) b.disabled = !has;
+  });
+  $('#usb-info').textContent = has ? 'Читаю данные тома…' : 'Флешка не найдена. Вставьте USB-накопитель в устройство — инструменты станут активны.';
   $('#usb-log').textContent = '';
-  usbRefreshInfo();
+  openDlg('dlg-usbtools');
+  if (has) usbRefreshInfo();
 }
+$('#usb-vol-select').onchange = () => {
+  usbVol = $('#usb-vol-select').value || null;
+  if (usbVol) usbRefreshInfo();
+  else $('#usb-info').textContent = 'Флешка не найдена. Вставьте USB-накопитель в устройство — инструменты станут активны.';
+};
 async function usbRefreshInfo() {
   const s = currentSerial(); if (!s || !usbVol) return;
   $('#usb-info').textContent = 'Читаю данные тома…';
@@ -3434,9 +4081,25 @@ function usbFakeEvent(ev) {
 
 /* свойства файла/папки (F6); + распаковка архивов, открытие текста/PDF/HTML,
    родная иконка и имя APK-файла с телефона, Android-бейдж на иконке */
+async function fsInstallApk(it, path) {
+  const s = currentSerial();
+  if (!s) return snack('Нет устройства');
+  const full = path || it.path || (fsDir.replace(/\/+$/, '') + '/' + it.name);
+  closeFsCtx();
+  snack('Устанавливаю «' + it.name + '»…', 6000);
+  const r = await window.api.apkPhoneInstall(s, full).catch(e => ({ ok: false, error: e.message }));
+  if (r && r.ok) {
+    snack('Установлено: ' + it.name);
+    try { invalidateAppsCache(); } catch (e) {}
+  } else {
+    snack('Не удалось установить: ' + (r && (r.message || r.error) || 'ошибка'), 15000);
+  }
+}
+let fsPropsSeq = 0;
 async function openFsProps(it) {
   const s = currentSerial();
   if (!s) return snack('Нет устройства');
+  const seq = ++fsPropsSeq;
   const full = it.path || (fsDir.replace(/\/+$/, '') + '/' + it.name); // путь из категории тоже
   const isApk = !it.dir && APK_RE.test(it.name);
   const ic = window.FSICONS.iconFor(it.name, it.dir);
@@ -3487,6 +4150,7 @@ async function openFsProps(it) {
   actBtns.push(addBtn('btn-fsprop-tozip', 'В архив ZIP', 'Собрать ZIP (файлы/папки) в текущей папке'));
   openDlg('dlg-fsprop');
   const st = await window.api.fsStat(s, full);
+  if (seq !== fsPropsSeq) return;
   const isDir = it.dir || /directory/i.test(st.kind || '');
   const rows = [
     ['Тип', isDir ? 'Папка' : ('Файл · ' + ((it.name.match(/\.([a-z0-9]+)$/i) || ['', 'без расширения'])[1].toUpperCase()))],
@@ -3504,6 +4168,7 @@ async function openFsProps(it) {
   // родная иконка/имя APK: тянем мету файла с телефона (кэшируется после первого раза)
   if (isApk) {
     const meta = await window.api.apkRemoteMeta(s, full).catch(() => null);
+    if (seq !== fsPropsSeq) return;
     if (meta && meta.ok && meta.dataUrl) {
       const img = $('#fsprop-icon'); if (img) img.src = meta.dataUrl;
       if (meta.label || meta.package) {
@@ -3513,35 +4178,53 @@ async function openFsProps(it) {
     } else if (meta && meta.reason === 'big') {
       $('#fsprop-body').insertAdjacentHTML('afterbegin', '<div class="prop-row"><b>Иконка приложения:</b><span>APK больше 80 МБ — для скорости не разбираю</span></div>');
     }
-    // СРАВНЕНИЕ С УСТАНОВЛЕННОЙ ВЕРСИЕЙ + кнопка «Установить на телефон»
+    // ДВЕ ВЕРСИИ БЕЗ СРАВНЕНИЙ: что стоит на устройстве и что в файле
     if (meta && meta.ok && meta.package) {
       const inst = await window.api.apkInstalledInfo(s, meta.package).catch(() => null);
+      if (seq !== fsPropsSeq) return;
       const fileV = meta.versionName || null;
-      if (inst && inst.installed) {
-        const cmp = (() => {
-          const a = String(inst.versionCode || ''), b = String(meta.versionCode || '');
-          if (a && b && +a > +b) return 'УСТАНОВЛЕННАЯ НОВЕЕ файла';
-          if (a && b && +a < +b) return 'файл НОВЕЕ установленной';
-          if (String(inst.versionName || '') === String(fileV || '')) return 'версии совпадают';
-          return 'версии различаются';
-        })();
+      const fileC = meta.versionCode != null ? String(meta.versionCode) : '';
+      const installed = !!(inst && inst.installed);
+      if (installed) {
         $('#fsprop-body').insertAdjacentHTML('beforeend',
-          '<div class="prop-row"><b>Установлено на телефоне:</b><span>v' + esc(inst.versionName || '?') + (inst.versionCode ? ' (код ' + esc(inst.versionCode) + ')' : '') + ' · ' + esc(cmp) + '</span></div>');
+          '<div class="prop-row"><b>Установлена на устройстве:</b><span>v' + esc(inst.versionName || '?') + (inst.versionCode ? ' (код ' + esc(inst.versionCode) + ')' : '') + '</span></div>');
       } else {
         $('#fsprop-body').insertAdjacentHTML('beforeend',
-          '<div class="prop-row"><b>Установлено на телефоне:</b><span>не установлено</span></div>');
+          '<div class="prop-row"><b>На устройстве:</b><span>не установлена</span></div>');
       }
+      $('#fsprop-body').insertAdjacentHTML('beforeend',
+        '<div class="prop-row"><b>Моя версия (APK-файл):</b><span>v' + esc(fileV || '?') + (fileC ? ' (код ' + esc(fileC) + ')' : '') + '</span></div>');
       if (/\.apk$/i.test(it.name)) {
-        const ib = addBtn('btn-fsprop-phoneinstall', 'Установить на телефон', 'Установить этот APK прямо с памяти телефона (pm install -r) — без скачивания на ПК');
+        const label = installed ? 'Обновить' : 'Установить';
+        const tip = installed ? 'Обновить приложение на устройстве' : 'Установить приложение на устройстве';
+        const ib = addBtn('btn-fsprop-phoneinstall', label, tip);
         ib.classList.add('btn-filled');
         ib.onclick = async () => {
-          ib.disabled = true; ib.textContent = 'Устанавливаю…';
+          ib.disabled = true; const old = ib.textContent; ib.textContent = 'Устанавливаю…';
           const r = await window.api.apkPhoneInstall(s, full);
-          ib.disabled = false; ib.textContent = 'Установить на телефон';
-          if (r.ok) snack('Установлено: ' + (meta.label || it.name));
-          else snack('Не удалось установить: ' + (r.message || r.error || 'ошибка'), 7000);
+          ib.disabled = false; ib.textContent = old;
+          if (r.ok) {
+            snack((label === 'Обновить' ? 'Обновлено: ' : 'Установлено: ') + (meta.label || it.name));
+            try { invalidateAppsCache(); } catch (e) {}
+            closeDlg('dlg-fsprop');
+          } else snack('Не удалось установить: ' + (r.message || r.error || 'ошибка'), 7000);
         };
       }
+    } else if (/\.apk$/i.test(it.name)) {
+      // метаданные не разобрались (большой APK, нестандартная упаковка) —
+      // всё равно даём установить: pm install -r работает без разбора иконки
+      const ib = addBtn('btn-fsprop-phoneinstall', 'Установить', 'Установить APK прямо с памяти телефона (pm install -r) — без метаданных и без скачивания на ПК');
+      ib.classList.add('btn-filled');
+      ib.onclick = async () => {
+        ib.disabled = true; ib.textContent = 'Устанавливаю…';
+        const r = await window.api.apkPhoneInstall(s, full);
+        ib.disabled = false; ib.textContent = 'Установить';
+        if (r.ok) {
+          snack('Установлено: ' + it.name);
+          try { invalidateAppsCache(); } catch (e) {}
+          closeDlg('dlg-fsprop');
+        } else snack('Не удалось установить: ' + (r.message || r.error || 'ошибка'), 7000);
+      };
     }
   }
   for (const b of actBtns) {
@@ -3574,11 +4257,40 @@ async function openFsProps(it) {
    внешние тома (OTG-флешки XXXX-XXXX) — со значком USB и кнопками обмена */
 const USB_ICON_SVG = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#4fc3f7" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="10" width="6" height="11" rx="1.5"/><path d="M10 10V6l2-3 2 3v4"/><rect x="10.6" y="3.4" width="1" height="1" fill="#4fc3f7" stroke="none"/><rect x="12.4" y="4.6" width="1" height="1" fill="#4fc3f7" stroke="none"/></svg>');
 const SD_ICON_SVG = 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#66bb6a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3h7l4 4v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M9 7v3M11.5 6v4M14 7v3"/></svg>');
+let usbPnpCache = { ts: 0, items: [] };
+async function getUsbPnp() {
+  const now = Date.now();
+  if (now - usbPnpCache.ts < 15000) return usbPnpCache.items;
+  const items = await window.api.usbPnp().catch(() => []);
+  usbPnpCache = { ts: now, items };
+  return items;
+}
+function bindMtpChips(box) {
+  box.querySelectorAll('[data-mtp-dev]').forEach(b => b.onclick = () => openMtpBrowser(b.dataset.mtpDev));
+}
+let fsVolSeq = 0;
 async function renderFsVolumes() {
+  const seq = ++fsVolSeq;
+  const serialAtStart = activeSerial;
   const s = currentSerial();
-  if (!s) { $('#fs-volumes').innerHTML = ''; fsFlash = null; return; }
-  const r = await window.api.fsVolumes(s);
+  const mtpActive = isMtpSerial(serialAtStart);
+  const usbDevs = mtpActive ? await getUsbPnp() : [];
+  if (seq !== fsVolSeq || activeSerial !== serialAtStart) return;
   const box = $('#fs-volumes');
+  // MTP-чип — только для реально выбранного MTP. При активном ADB его здесь быть не должно.
+  const mtpChips = mtpActive
+    ? (usbDevs || []).filter(u => 'mtp:' + u.name === activeSerial).map(u =>
+      `<button class="chip mtp-chip" data-mtp-dev="${esc(u.name)}" data-tip="Открыть файлы ${esc(u.name)} через MTP: только обмен файлами, ADB-функции недоступны">📱 ${esc(u.name)} (MTP)</button>`
+    ).join('')
+    : '';
+  if (!s) {
+    box.innerHTML = mtpChips;
+    bindMtpChips(box);
+    fsFlash = null;
+    return;
+  }
+  const r = await window.api.fsVolumes(s);
+  if (seq !== fsVolSeq || activeSerial !== serialAtStart) return;
   const vols = (r.vols || []).filter(v => v !== 'emulated' && v !== 'self'); // дубль «Внутренней памяти» убран ()
   // показываем ВСЕ смонтированные тома (внутренняя, SD-карта, OTG), а не только FAT-UUID.
   const mounts = Array.isArray(r.mounts) ? r.mounts.slice() : [];
@@ -3600,9 +4312,10 @@ async function renderFsVolumes() {
     `<button class="chip vol-chip" data-vol="${esc(m.path)}" data-tip="Открыть ${esc(label(m))}: ${esc(m.path)} (правая кнопка — меню)">
       <img src="${SD_ICON_SVG}" alt="">${esc(label(m))}</button>`
   ).join('') +
-    (external.length ? '<button class="chip" id="btn-usb-tools" data-tip="Форматирование, метка тома, проверка ошибок, проверка на фейковую память">⚙ Инструменты флешки</button>' +
-      '<span class="muted small" data-tip="Кнопки «На флешку»/«На телефон» появляются у файлов, когда флешка вставлена">обмен телефон ⟷ флешка включён</span>' : '') +
-    (internal ? '' : '');
+    mtpChips +
+    `<span class="usb-tools-wrap" data-tip="${esc(external.length ? 'Форматирование, метка тома, проверка ошибок и проверка на фейковую память. Выберите флешку в открывшемся окне.' : 'Флешка не найдена. Вставьте USB-накопитель в устройство — инструменты станут активны.')}"><button class="chip" id="btn-usb-tools"${external.length ? '' : ' disabled'}>⚙ Инструменты флешки</button></span>` +
+    (external.length ? '<span class="muted small" data-tip="Кнопки «На флешку»/«На телефон» появляются у файлов, когда флешка вставлена">обмен телефон ⟷ флешка включён</span>' : '<span class="muted small">флешка не вставлена — инструменты неактивны</span>');
+  bindMtpChips(box);
   box.querySelectorAll('[data-vol]').forEach(b => {
     const p = b.dataset.vol;
     const name = p.split('/').pop();
@@ -3619,7 +4332,7 @@ async function renderFsVolumes() {
     };
   });
   const ut = document.getElementById('btn-usb-tools');
-  if (ut) ut.onclick = () => openUsbTools(fsFlash ? fsFlash.split('/').pop() : external[0].id);
+  if (ut && external.length) ut.onclick = () => openUsbTools(fsFlash ? fsFlash.split('/').pop() : String(external[0].path).split('/').pop());
   renderFsSysVolumes(r);
 }
 
@@ -3634,9 +4347,13 @@ function renderFsSysVolumes(r) {
     { p: '/data', n: 'Данные /data' },
     { p: '/vendor', n: 'Vendor /vendor' }
   ];
-  box.innerHTML = sys.map(v =>
-    `<button class="chip sys-chip" data-sysvol="${esc(v.p)}" data-tip="${root ? 'Открыть ' : 'Без root содержимое может быть недоступно: '}${esc(v.p)}">${esc(v.n)}${root ? '' : ' 🔒'}</button>`
-  ).join('') + (root
+  box.innerHTML = sys.map(v => {
+    const tip = root ? 'Открыть ' + v.p
+      : v.p === '/data' ? 'Раздел /data защищён Android: без root содержимое недоступно — это не ошибка программы'
+      : v.p === '/' ? 'Корень откроется, но часть системных файлов будет недоступна без root'
+      : 'Без root содержимое может быть недоступно: ' + v.p;
+    return `<button class="chip sys-chip" data-sysvol="${esc(v.p)}" data-tip="${esc(tip)}">${esc(v.n)}${root ? '' : ' 🔒'}</button>`;
+  }).join('') + (root
     ? '<span class="count-chip" data-tip="Устройство даёт root-доступ — системные разделы доступны на чтение">root ✓</span>'
     : '<span class="muted small">Системные разделы доступны только с root</span>');
   box.querySelectorAll('[data-sysvol]').forEach(b => b.onclick = () => fsNavigate(b.dataset.sysvol));
@@ -3675,7 +4392,7 @@ async function ivLoad(full) {
   iv.loading = token;
   // картинки тоже показываем ПОТОКОМ с телефона — в кэш ПК файл не скачивается.
   // Если потоковый сервер недоступен, откатываемся на blob (как раньше).
-  let url = null, bytes = 0;
+  let url = null, bytes = 0, blobUrl = false;
   try {
     const su = await window.api.mediaUrl(s, full);
     if (su && su.ok) url = su.url;
@@ -3687,20 +4404,34 @@ async function ivLoad(full) {
     bytes = r.bytes || 0;
     const blob = new Blob([r.buf], { type: /jpe?g$/i.test(full) ? 'image/jpeg' : /png$/i.test(full) ? 'image/png' : /gif$/i.test(full) ? 'image/gif' : /webp$/i.test(full) ? 'image/webp' : /bmp$/i.test(full) ? 'image/bmp' : 'image/png' });
     url = URL.createObjectURL(blob);
+    blobUrl = true;
   }
-  if (iv.loading !== token) return;
+  if (iv.loading !== token) { if (blobUrl) URL.revokeObjectURL(url); return; }
   img.onload = () => {
+    if (blobUrl) URL.revokeObjectURL(url);
     iv.natural = { w: img.naturalWidth || 1, h: img.naturalHeight || 1 };
     msg.classList.add('hidden');
     ivFit();
     $('#imgview-status').textContent = full + ' · ' + iv.natural.w + '×' + iv.natural.h + (bytes ? ' · ' + fmtBytesLong(bytes) : ' · поток с телефона');
   };
-  img.onerror = () => { msg.textContent = 'Формат не поддерживается встроенным просмотрщиком (например HEIC) — скачайте файл'; };
+  img.onerror = () => {
+    if (blobUrl) URL.revokeObjectURL(url);
+    msg.textContent = 'Формат не поддерживается встроенным просмотрщиком (например HEIC) — скачайте файл';
+  };
   img.src = url;
 }
 // плёнка-карусель внизу просмотрщика — карточки изображений папки, как в Windows.
 // Клик по карточке = переход к этому фото; текущая подсвечена; миниатюры грузятся лениво.
-let stripThumbs = new Map(); // путь → dataURL (кэш на открытие папки)
+let stripThumbs = new Map();
+let stripThumbsGen = 0, stripThumbsDir = '';
+const stripPending = new Set();
+function ivThumbsClear() {
+  stripThumbsGen++;
+  for (const u of stripThumbs.values()) { try { URL.revokeObjectURL(u); } catch (e) {} }
+  stripThumbs.clear();
+  stripPending.clear();
+  stripThumbsDir = '';
+}
 function ivStripCard(it, i) {
   const cur = i === iv.idx ? ' cur' : '';
   const p = fsDir.replace(/\/+$/, '') + '/' + it.name;
@@ -3713,6 +4444,11 @@ function ivStripCard(it, i) {
 function ivRenderStrip() {
   const strip = $('#imgview-strip');
   if (!iv.list.length) { strip.innerHTML = ''; return; }
+  if (stripThumbsDir !== fsDir) {
+    ivThumbsClear();
+    stripThumbsDir = fsDir;
+  }
+  const gen = stripThumbsGen;
   strip.innerHTML = iv.list.map((it, i) => ivStripCard(it, i)).join('');
   strip.querySelectorAll('[data-strip]').forEach(c => c.onclick = () => {
     const target = +c.dataset.strip;
@@ -3722,18 +4458,29 @@ function ivRenderStrip() {
   if (cur) cur.scrollIntoView({ block: 'nearest', inline: 'center' });
   // ленивые миниатюры: по 3 параллельно, только для карточек без кэша
   const jobs = iv.list.map((it, i) => ({ it, i, p: fsDir.replace(/\/+$/, '') + '/' + it.name }))
-    .filter(j => !stripThumbs.has(j.p)).slice(0, 60);
+    .filter(j => !stripThumbs.has(j.p) && !stripPending.has(j.p)).slice(0, 60);
   let run = 0; let idx = 0;
   const next = () => {
+    if (gen !== stripThumbsGen) return;
     while (run < 3 && idx < jobs.length) {
       const j = jobs[idx++];
       run++;
+      stripPending.add(j.p);
       window.api.fsCat(currentSerial(), j.p, 12).then(r => {
+        if (gen !== stripThumbsGen) return;
         if (r.ok && r.buf && r.buf.length) {
           const blob = new Blob([r.buf], { type: /jpe?g$/i.test(j.p) ? 'image/jpeg' : 'image/png' });
+          const old = stripThumbs.get(j.p);
+          if (old) { try { URL.revokeObjectURL(old); } catch (e) {} }
           stripThumbs.set(j.p, URL.createObjectURL(blob));
         }
-      }).catch(() => {}).finally(() => { run--; next(); if (run === 0) ivRenderStrip(); });
+      }).catch(() => {}).finally(() => {
+        stripPending.delete(j.p);
+        if (gen !== stripThumbsGen) return;
+        run--;
+        next();
+        if (run === 0) ivRenderStrip();
+      });
     }
   };
   next();
@@ -4765,13 +5512,25 @@ document.addEventListener('mouseup', (e) => {
 });
 $('#btn-fs-go').onclick = () => fsNavigate($('#fs-path').value.trim() || '/sdcard');
 $('#fs-path').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-fs-go').click(); });
-$('#btn-fs-up').onclick = () => { const p = fsDir.replace(/\/+$/, '').split('/'); p.pop(); fsNavigate(p.join('/') || '/'); };
-$('#btn-fs-refresh').onclick = fsRender;
+$('#btn-fs-up').onclick = () => {
+  if (isMtpSerial(activeSerial)) { if (mtpInlineState.path.length) { const parent = '/' + mtpInlineState.path.slice(0, -1).join('/'); mtpNavigate(parent || '/'); } return; }
+  const p = fsDir.replace(/\/+$/, '').split('/'); p.pop(); fsNavigate(p.join('/') || '/');
+};
+$('#btn-fs-refresh').onclick = () => { if (isMtpSerial(activeSerial)) return mtpFsRender(); fsCatCache = {}; fsCatCounts = {}; renderFsQuick(); fsRender(); };
 $('#fs-filter').addEventListener('input', () => fsRender());
 $('#btn-fs-toconnect').onclick = () => goPage('devices');
 
 /* загрузка на телефон — ВСЕГДА в ОТКРЫТУЮ папку (F7) */
 $('#btn-fs-push').onclick = async () => {
+  if (isMtpSerial(activeSerial)) {
+    const st = $('#fs-storage');
+    st.textContent = 'Выберите файл на компьютере…';
+    const rr = await window.api.mtpUpload(mtpNameOf(activeSerial), mtpInlineState.path).catch(e => ({ ok: false, error: e.message }));
+    if (!rr || !rr.ok) { st.textContent = rr && rr.canceled ? 'USB MTP · только файловый обмен' : mtpErrMsg(rr); return; }
+    snack('Загружено: ' + rr.name);
+    await mtpFsRender();
+    return;
+  }
   const s = currentSerial(); if (!s) return snack('Нет устройства');
   const files = await window.api.pickFile({ properties: ['openFile', 'multiSelections'] });
   if (!files || !files.length) return;
@@ -5721,6 +6480,9 @@ if (res.ok) {
 // на телефоне, и оно САМО появляется в списке (раньше надо было переключать вкладки)
 let procAutoTimer = null;
 let procAutoBusy = false;
+function procAutoStop() {
+  if (procAutoTimer) { clearInterval(procAutoTimer); procAutoTimer = null; }
+}
 function procAutoStart() {
   if (procAutoTimer) return;
   procAutoTimer = setInterval(async () => {
@@ -5734,6 +6496,7 @@ function procAutoStart() {
 function appsRender() {
   if (!appsData) return;
   if (appsTab === 'procs') { procsRender(); procAutoStart(); return; }
+  procAutoStop();
   $('#btn-killall-procs').classList.add('hidden');
   $('#proc-stats').classList.add('hidden');
   const q = ($('#apps-search').value || '').toLowerCase();
@@ -5906,37 +6669,8 @@ document.addEventListener('mousemove', (e) => {
   card.style.setProperty('--mx', (e.clientX - r.left) + 'px');
   card.style.setProperty('--my', (e.clientY - r.top) + 'px');
 }, { passive: true });
-/* крестик очистки внутри любого текстового поля (delegated) */
-function attachInputClear(input) {
-  if (!input || input.dataset.icDone) return;
-  const parent = input.parentElement;
-  if (!parent || parent.querySelector('.ic-clear')) return;
-  input.dataset.icDone = '1';
-  parent.classList.add('ic-wrap');
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'ic-clear';
-  btn.textContent = '\u2715';
-  btn.setAttribute('data-tip', 'Очистить поле');
-  btn.addEventListener('click', () => {
-    input.value = '';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-    btn.classList.remove('show');
-    input.focus();
-  });
-  parent.appendChild(btn);
-  const upd = () => btn.classList.toggle('show', !!input.value);
-  input.addEventListener('input', upd, { passive: true });
-  input.addEventListener('keyup', upd, { passive: true });
-  upd();
-}
-document.addEventListener('focusin', (e) => {
-  const t = e.target;
-  if (!t || (t.tagName !== 'INPUT' && t.tagName !== 'TEXTAREA')) return;
-  if (t.type && !/text|search|url|tel/.test(t.type)) return;
-  attachInputClear(t);
-});
+/* Крестик очистки — ТОЛЬКО у фильтров (attachClear): фильтр файлов, поиск приложений и т.п.
+   Раньше delegated-обработчик вешал крестик на любое поле, включая путь — убрано. */
 /* салют по клику на автора (фейерверк на весь экран) */
 let saluteRAF = 0;
 function runSalute() {
@@ -6440,8 +7174,9 @@ $('#set-autostart').onchange = async e => {
   const r = await window.api.setSetting('autostart', e.target.checked);
   if (!r.ok) { snack(r.message || 'Не удалось изменить автостарт'); e.target.checked = !e.target.checked; }
 };
-$('#set-tray').onchange = e => window.api.setSetting('closeToTray', e.target.checked);
-$('#set-autoreconnect').onchange = e => window.api.setSetting('autoreconnect', e.target.checked);
+$('#set-close-mode').onchange = e => window.api.setSetting('closeToTray', e.target.value === 'tray');
+  $('#set-autoreconnect').onchange = e => window.api.setSetting('autoreconnect', e.target.checked);
+  if ($('#dev-autoconnect')) $('#dev-autoconnect').onchange = e => window.api.setSetting('autoconnect', e.target.checked);
 $('#set-sounds').onchange = e => { snd.on = e.target.checked; window.api.setSetting('sounds', e.target.checked); };
 $('#set-autolast').onchange = e => window.api.setSetting('autolast', e.target.checked);
 /* MCP-агент — тумблер и аварийная остановка */
@@ -6458,18 +7193,46 @@ $('#btn-agent-reset').onclick = async () => {
   const r = await window.api.agentReset().catch(() => null);
   snack(r && r.ok ? 'Флаг остановки сброшен — агент может работать снова' : 'Не удалось сбросить');
 };
+function agentHelpText() {
+  const serial = activeSerial || 'определи через get_app_state';
+  return 'ADB Wi-Fi Connector — MCP для управления Android\n\n' +
+    'Адрес: ' + agentMcpEndpoint + '\n' +
+    'Транспорт: HTTP JSON-RPC 2.0, без токена.\n' +
+    'Активное устройство: ' + serial + '. serial можно не указывать — сервер подставит активное.\n\n' +
+    'Подключение:\n' +
+    '1. Вызови initialize, затем tools/list. Дальше работай через tools/call.\n' +
+    '2. Если управление выключено — вызови agent/set-enabled {enabled:true}.\n' +
+    '3. Сначала вызови get_app_state. Не выдумывай инструменты: список бери из tools/list.\n\n' +
+    'Что использовать:\n' +
+    '- Экран телефона: device_screen_state. Для модели без зрения — device_ui: текстовое дерево с кнопками, текстами, content-desc и bounds. Для зрения — device_screenshot.\n' +
+    '- Файлы: искать через adb_shell (find /storage/emulated/0 -type f -iname "*имя*"), скачать pull_file, загрузить push_file, удалить adb_shell rm.\n' +
+    '- Приложения: app_action; произвольные команды: adb_shell/adb_raw; ввод: device_input; перезагрузка: reboot_device.\n' +
+    '- Опасные действия (удаление, uninstall, reboot) выполняй только по явной команде пользователя.\n\n' +
+    'Верни результат: что сделано, путь файла на ПК или текст ошибки. Не утверждай, что действие выполнено, без ответа инструмента.';
+}
+function openAgentHelp() {
+  const pre = $('#agent-help-text');
+  if (pre) pre.textContent = agentHelpText();
+  openDlg('dlg-agent-help');
+}
+$('#btn-agent-help').onclick = openAgentHelp;
+$('#btn-agent-help-copy').onclick = () => {
+  const pre = $('#agent-help-text');
+  copyText(pre ? pre.textContent : agentHelpText());
+};
 (async function agentInit() {
   const st = await window.api.agentGetState().catch(() => null);
   if (st && st.ok) {
+    if (st.endpoint) agentMcpEndpoint = st.endpoint;
     const box = $('#set-agent-enabled');
     if (box) box.checked = !!st.enabled;
     const logs = st.logs || [];
-    if (logs.length && $('#agent-mcp-addr')) {
-      $('#agent-mcp-addr').innerHTML = 'MCP-сервер: <span class="mono">http://127.0.0.1:3939/mcp</span> · последних действий: <b>' + logs.length + '</b>';
+    if ($('#agent-mcp-addr')) {
+      $('#agent-mcp-addr').innerHTML = 'MCP-сервер: <span class="mono">' + esc(agentMcpEndpoint) + '</span> · последних действий: <b>' + logs.length + '</b>';
     }
   }
 })();
-$('#set-theme').onchange = e => { document.body.dataset.theme = e.target.value; window.api.setSetting('theme', e.target.value); };
+  $('#set-theme').onchange = e => { applyTheme(e.target.value); window.api.setSetting('theme', e.target.value); };
 /* ---------- ассоциации файлов APK (реестр Windows, HKCU) ---------- */
     const ASSOC_EXTS_UI = ['apk', 'aab', 'apks', 'xapk', 'apkm', 'obb', 'apup'];
 async function assocRefresh() {
@@ -6614,13 +7377,19 @@ window.api.onTask(async ev => {
     // запись прервалась сама (лимит 3 мин или died-процесс) — синхронизируем UI и предлагаем сохранить
     clearInterval(recTimer); recTimer = null;
     recordUIReset();
-    if (ev.auto && ev.serial && ev.remote) {
+    if (ev.auto && ev.file) {
+      snack('Запись автоматически остановлена (лимит 3 мин). Видео сохранено: ' + ev.file, 7000);
+      window.api.showItem(ev.file);
+    } else if (ev.auto && ev.error) {
+      snack('Запись остановлена: ' + ev.error, 6000);
+    } else if (ev.auto && ev.serial && ev.remote) {
       snack('Запись автоматически остановлена (лимит 3 мин). Сохраняю видео с телефона…', 6000);
       const r = await window.api.fsPull(ev.serial, ev.remote);
       if (r.ok) snack('Видео сохранено: ' + r.file);
       window.api.fsCmd(ev.serial, ['rm', '-f', ev.remote]);
     }
   } else if (ev.kind === 'shell-stopped') {
+    shellSerial = null;
     if (shellOn) {
       shellOn = false;
       $('#shell-view').textContent += '\n[сессия остановлена]\n';
@@ -6682,11 +7451,13 @@ window.api.onTask(async ev => {
 function goPage(name, opts) {
   $$('.rail-item').forEach(x => x.classList.toggle('active', x.dataset.page === name));
   $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + name));
+  if (name !== 'apps') procAutoStop();
   updateToolsState();
   if (name === 'files') {
     // R11: файлы телефона отображаются СРАЗУ, без кнопок «Открыть»/«Открыть память»
     if (!(opts && opts.skipFsRender)) fsRender();
     renderFsVolumes();
+    
     const s = currentSerial();
     if (s && !infoCache[s]) devInfoText(s).then(() => {
       const i = infoCache[s] && infoCache[s].info;
@@ -6695,10 +7466,29 @@ function goPage(name, opts) {
   }
   if (name === 'apps' && !appsData) appsLoad();
   if (name === 'apk') renderApkTargets();
+  if (name === 'camera' && window.cameraPageEnter) window.cameraPageEnter();
+  if (name === 'mic' && window.micPageEnter) window.micPageEnter();
     if (name === 'tools') setTimeout(() => { try { unlockRefresh(); } catch (e) {} }, 120);
 }
 
 (async function init() {
+  if (window.api && window.api.onSettingChanged) {
+    window.api.onSettingChanged((data) => {
+      if (!data) return;
+      if (data.key === 'autoconnect' && $('#dev-autoconnect')) $('#dev-autoconnect').checked = !!data.value;
+      if (data.key === 'autoreconnect' && $('#set-autoreconnect')) $('#set-autoreconnect').checked = !!data.value;
+      if (data.key === 'autolast' && $('#set-autolast')) $('#set-autolast').checked = !!data.value;
+      if (data.key === 'theme') applyTheme(data.value);
+    });
+  }
+  const themeToggle = $('#btn-theme-toggle');
+  if (themeToggle) {
+    themeToggle.addEventListener('click', () => {
+      const next = document.body.dataset.theme === 'light' ? 'dark' : 'light';
+      applyTheme(next);
+      window.api.setSetting('theme', next);
+    });
+  }
   // крестик очистки внутри полей поиска (не отдельной кнопкой «за интерфейсом»)
   ['apps-search', 'fs-filter', 'logcat-filter', 'arc-filter'].forEach(attachClear);
 
@@ -6836,7 +7626,7 @@ document.addEventListener('pointerdown', e => {
 (function initFileDrop() {
   const box = $('#fs-list');
   if (!box) return;
-  const folderOf = t => (t && t.closest) ? t.closest('.fs-row[data-fsdir="1"], .fs-cell[data-isdir="1"]') : null;
+  const folderOf = t => (t && t.closest) ? t.closest('.fs-row[data-fsdir="1"], .fs-cell[data-isdir="1"], .fs-row[data-mtp-dir="1"], .fs-cell[data-mtp-dir="1"]') : null;
   let over = null;
   const clear = () => {
     if (over) over.classList.remove('drop-target');
@@ -6866,17 +7656,38 @@ document.addEventListener('pointerdown', e => {
     clear();
     if (!$('#page-files').classList.contains('active')) return snack('Откройте страницу «Файлы», чтобы загрузить файлы');
     if (document.querySelector('.overlay:not(.hidden)')) return;
-    const s = currentSerial();
-    if (!s) return snack('Сначала подключите телефон');
-    if (fsCatKind && !f) return snack('Откройте папку на телефоне, чтобы загрузить сюда файлы');
-    const dir = f ? (f.dataset.fsfull || f.dataset.fspath) : fsDir;
     const paths = [];
     for (const file of Array.from(dt.files)) {
       try { const p = window.api.pathForFile(file); if (p) paths.push(p); } catch (err) {}
     }
     if (!paths.length) return snack('Не удалось получить путь файла');
+    if (isMtpSerial(activeSerial)) {
+      const target = f ? (f.dataset.mtpPath || fsDir) : fsDir;
+      const parts = String(target || '/').split('/').filter(Boolean);
+      let ok = 0, lastErr = '';
+      for (const p of paths) {
+        const rr = await window.api.mtpUpload(mtpNameOf(activeSerial), parts, p).catch(e => ({ ok: false, error: e.message }));
+        if (rr && rr.ok) ok++; else lastErr = rr && (rr.error || rr.message) || '';
+      }
+      snack('Загружено на MTP: ' + ok + ' из ' + paths.length + (lastErr ? ' · ' + lastErr : ''), 7000);
+      await mtpFsRender();
+      return;
+    }
+    const s = currentSerial();
+    if (!s) return snack('Сначала подключите телефон');
+    if (fsCatKind && !f) return snack('Откройте папку на телефоне, чтобы загрузить сюда файлы');
+    const dir = f ? (f.dataset.fsfull || f.dataset.fspath) : fsDir;
     await fsUploadLocalPaths(paths, dir);
   });
+  // MTP при старте: список по умолчанию (после инициализации fsView из ползунка)
+  setTimeout(() => {
+    try {
+      if (isMtpSerial(activeSerial)) {
+        setFsListMode();
+    if ($('#page-files') && $('#page-files').classList.contains('active')) { mtpFsRender(); renderFsVolumes(); }
+      }
+    } catch (e) {}
+  }, 1500);
 })();
 
 // Громкость, выставленная в отдельном окне, запоминается на время работы программы:

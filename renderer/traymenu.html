@@ -27,11 +27,29 @@
   .sep { height: 1px; background: rgba(255,255,255,.09); margin: 5px 8px; }
   .mi.danger { color: #f28b82; }
   .mi.danger:hover { background: rgba(242,139,130,.14); }
+  .tray-device {
+    padding: 4px 12px 8px 40px;
+    color: #a9b6c6;
+    font-size: 11px;
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tray-device b { color: #e8edf2; font-weight: 600; }
+  .tray-auto {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 12px 8px 12px;
+    color: #cbd5e1; font-size: 12px; cursor: pointer;
+  }
+  .tray-auto input { accent-color: #6366f1; }
 </style>
 </head>
 <body>
 <div class="menu">
   <button class="mi" id="m-show"><span class="ic">&#9632;</span>Показать окно</button>
+  <div class="tray-device" id="tray-device">Проверяю…</div>
+  <label class="tray-auto"><input type="checkbox" id="tray-auto"><span>Автоподключение</span></label>
   <div class="sep"></div>
   <button class="mi" id="m-scan"><span class="ic">&#8635;</span>Сканировать сеть</button>
   <button class="mi" id="m-sett"><span class="ic">&#9881;</span>Настройки</button>
@@ -45,6 +63,27 @@
   act('m-scan', 'scan');
   act('m-sett', 'sett');
   act('m-exit', 'exit');
+
+  async function refresh() {
+    try {
+      const s = await a.trayState();
+      if (!s || !s.ok) return;
+      document.getElementById('tray-auto').checked = !!s.autoconnect;
+      const box = document.getElementById('tray-device');
+      if (!s.devices || !s.devices.length) {
+        box.textContent = 'Не подключено';
+      } else if (s.devices.length === 1) {
+        box.textContent = s.devices[0].model;
+      } else {
+        box.textContent = 'Устройств: ' + s.devices.length;
+      }
+    } catch (e) {}
+  }
+  document.getElementById('tray-auto').addEventListener('change', async (event) => {
+    await a.traySetAutoconnect(!!event.target.checked);
+  });
+  window.addEventListener('focus', refresh);
+  refresh();
 </script>
 </body>
 </html>
