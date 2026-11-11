@@ -97,6 +97,7 @@
 
 - `main.js`, `adb.js`, `mdns.js`, `preload.js`, `qrpair.js` — основная логика приложения (Electron).
 - `renderer/` — интерфейс: HTML, CSS, JS.
+- `camera/` — камера и микрофон: Python-серверы, C++ исходники виртуальной камеры, Android-приложение и драйвер VB-CABLE.
 - `installer/src/` — установщик на C#/WinForms.
 - `shellext/` — расширение Проводника Windows.
 - `tools/` — лаунчер и служебные скрипты.
@@ -109,4 +110,4 @@
 
 ## Лицензия
 
-Код этой сборки — MIT. adb — Android SDK Platform-Tools (© Google), scrcpy — Apache-2.0. Лицензии сторонних компонентов лежат в `shellext/` и описаны в `README-BUILD.md`.
+Код этой сборки — MIT. adb — Android SDK Platform-Tools (© Google), scrcpy — Apache-2.0. VB-CABLE — сторонний подписанный драйвер, условия — в `camera/drivers/VBCABLE/readme.txt`. Лицензии сторонних компонентов лежат в `shellext/` и описаны в `README-BUILD.md`.

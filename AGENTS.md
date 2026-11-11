@@ -26,6 +26,7 @@ ADB_WiFi_Connector_v3.0/
   agent-mcp.js            MCP-сервер (порт 3939)
   apkicon.js, apkmini…    разбор APK/иконок
   renderer/               интерфейс: index.html, styles.css, app.js, lib/
+  camera/                 камера/микрофон: Python, C++ src, Android-cam, VB-CABLE
   assets/                 иконки приложения
   shellext/               готовая оболочка Explorer (DLL + лицензии)
   tools/                  launcher.c, launcher.rc, patch-icon.js
@@ -41,7 +42,7 @@ ADB_WiFi_Connector_v3.0/
     design/               утверждённый HTML-макет v2
 
   release/
-    ADB_WiFi_Connector_v3.0.exe   готовый установщик (126 МБ)
+    ADB_WiFi_Connector_v3.0.exe   готовый установщик (128 МБ)
 
   AGENTS.md               этот файл
   .gitignore

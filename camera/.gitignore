@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+bin/*.obj
+bin/*.lib
+bin/*.exp
+bin/*.pdb
+android-cam/build/
+android-cam/debug.keystore
+android-cam/android-cam.apk
+android-cam.apk.idsig

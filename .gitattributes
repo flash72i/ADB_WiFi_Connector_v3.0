@@ -5,3 +5,6 @@
 *.ico binary
 *.dll binary
 *.exe binary
+*.sys binary
+*.cat binary
+*.apk binary

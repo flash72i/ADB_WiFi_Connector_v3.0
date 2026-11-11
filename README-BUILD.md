@@ -32,6 +32,27 @@
    (нужен пакет gcc-mingw-w64-x86-64).
 7. Упаковать: zip всей папки (см. структуру в README-RU.md).
 
+## Камера и микрофон
+
+Исходники и готовые сборки — в `camera/`:
+
+- `camera/phonecam_server.py`, `camera/PhoneAudio.py`, `camera/phoneaudio_server.py`,
+  `camera/PhoneCamViewer.py` — Python-серверы, их запускает `main.js`.
+- `camera/src/` — C++ исходники виртуальной камеры; сборка:
+  `powershell -ExecutionPolicy Bypass -File camera\build-virtualcam.ps1`
+  (нужны Visual Studio Build Tools с C++; путь к `vcvars64.bat` можно задать в `VCVARS64`).
+- `camera/android-cam/` — исходник APK; сборка:
+  `powershell -ExecutionPolicy Bypass -File camera\build-android.ps1`
+  (нужны JDK 21 в `JAVA_HOME` и Android SDK в `ANDROID_HOME` / `ANDROID_SDK_ROOT`).
+- `camera/bin/` и `camera/android-cam.apk` — готовые сборки; после правок исходников
+  пересоберите их.
+- `camera/drivers/VBCABLE/` — сторонний подписанный драйвер VB-CABLE, не изменяйте.
+
+## shellext
+
+Готовая MIT-сборка ApkShellext2 лежит в `shellext/`. Исходник расширения —
+upstream `https://github.com/kkguo/apkshellext`; в этом репозитории он не дублируется.
+
 ## Журнал
 
 `app.log` в корне папки: старт, путь adb, результаты сканов/подключений/сопряжений,
