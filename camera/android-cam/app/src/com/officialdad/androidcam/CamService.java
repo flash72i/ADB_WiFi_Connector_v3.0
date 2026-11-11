@@ -1,0 +1,873 @@
+package com.officialdad.androidcam;
+
+import android.app.Notification;
+import android.graphics.Rect;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.content.Intent;
+import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraConstrainedHighSpeedCaptureSession;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraMetadata;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaFormat;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
+import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.os.SystemClock;
+import android.util.Log;
+import android.util.Range;
+import android.util.Size;
+import android.view.Surface;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileDescriptor;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Camera2 -> MediaCodec H.264 -> Annex-B over an abstract unix socket.
+ *
+ * There is deliberately no Activity. The host starts this with
+ * `am start-foreground-service`, which never wakes or unlocks the phone — waking a
+ * locked device starts face unlock, which opens a camera of its own and pushes the
+ * device past the system-wide open-camera limit, so our own open gets rejected.
+ * Being a foreground service is also what gets us past the Android 9+ ban on camera
+ * access from the background.
+ */
+public class CamService extends Service implements SensorEventListener {
+    static final String TAG = "android-cam";
+    static final String SOCKET = "android-cam";
+    static final String MIME = "video/avc";
+    static final String TOKEN_FILE = "control-token-camera";
+
+    // Defaults when the start intent carries no extras, so an old host still gets a stream.
+    static final int WIDTH = 1280;
+    static final int HEIGHT = 720;
+    static final int FPS = 30;
+    static final int BITRATE = 8_000_000;
+    static final int ZOOM = 100; // percent; 100 = no zoom
+
+    // Requested by the host, applied (clamped to what the camera offers) at the next
+    // client connect. Volatile: written on the main thread, read on the net thread.
+    private volatile int reqWidth = WIDTH;
+    private volatile int reqHeight = HEIGHT;
+    private volatile int reqFps = FPS;
+    private volatile int reqBitrate = BITRATE;
+    private volatile int reqZoom = ZOOM;
+    private volatile float reqFocus = -1f; // diopters, 0 = infinity; negative = autofocus
+    private volatile String reqCamera; // camera2 id; null = back camera default
+    private volatile boolean reqTorch;
+
+    // Live-session state, for mid-stream torch/zoom toggles and the dump() probe.
+    private volatile CameraCaptureSession activeSession;
+    private volatile CaptureRequest.Builder activeReq;
+    private volatile CameraCharacteristics activeChars;
+    private volatile boolean activeHighSpeed;
+    private volatile boolean connected;
+    private volatile long lastClientAt;
+    static final long IDLE_TIMEOUT_MS = 60_000L;
+
+    private volatile boolean running;
+    private LocalServerSocket server;
+    private Thread idleThread;
+    private HandlerThread camThread;
+    private Handler camHandler;
+    static final String ORIENTATION_SOCKET = "android-cam-orientation";
+    static final String CONTROL_SOCKET = "android-cam-control";
+    private volatile int deviceRotation;
+    private SensorManager sensorManager;
+    private Sensor gravitySensor;
+    private LocalServerSocket orientationServer;
+    private Thread orientationThread;
+    private LocalServerSocket controlServer;
+    private Thread controlThread;
+    private int candidateRotation;
+    private long candidateAt;
+    private long lastSensorLog;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+    }
+
+    private void startWorkers() {
+        if (running) return;
+        startForeground(1, notification());
+        camThread = new HandlerThread("cam");
+        camThread.start();
+        camHandler = new Handler(camThread.getLooper());
+        sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        if (sensorManager != null) {
+            gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY);
+            if (gravitySensor == null) {
+                gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            }
+            if (gravitySensor != null) {
+                sensorManager.registerListener(
+                        this, gravitySensor, SensorManager.SENSOR_DELAY_UI);
+            }
+        }
+        running = true;
+        lastClientAt = SystemClock.elapsedRealtime();
+        new Thread(this::serve, "net").start();
+        orientationThread = new Thread(this::serveOrientation, "orientation-net");
+        orientationThread.start();
+        controlThread = new Thread(this::serveControl, "control-net");
+        controlThread.start();
+        idleThread = new Thread(this::watchIdle, "cam-idle");
+        idleThread.start();
+    }
+
+    /**
+     * The host's config channel is the start intent itself:
+     * `am start-foreground-service -n …/.CamService --ei width 1920 --ei height 1080
+     * --ei fps 30 --ei bitrate 8000000`. The socket stays pure H.264 — the host-side
+     * client is ffmpeg reading the stream raw, so it cannot speak a handshake, and a
+     * reply frame would corrupt its input. `am` can be re-run on a live service to
+     * change the config; it takes effect on the next client connect.
+     */
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (!authorized(intent)) {
+            Log.w(TAG, "rejected start without control token");
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
+        startWorkers();
+        if (intent != null) {
+            reqWidth = positiveOr(intent.getIntExtra("width", 0), reqWidth);
+            reqHeight = positiveOr(intent.getIntExtra("height", 0), reqHeight);
+            reqFps = positiveOr(intent.getIntExtra("fps", 0), reqFps);
+            reqBitrate = positiveOr(intent.getIntExtra("bitrate", 0), reqBitrate);
+            reqZoom = positiveOr(intent.getIntExtra("zoom", 0), reqZoom);
+            // Fixed focus kills continuous-AF hunting (moving scenes blur while the lens
+            // re-seeks). Diopters: 0 = infinity, 2.0 = 50cm; negative = back to autofocus.
+            float focus = intent.getFloatExtra("focus", Float.NaN);
+            if (!Float.isNaN(focus)) reqFocus = focus;
+            String cam = intent.getStringExtra("camera");
+            if (cam != null) reqCamera = cam.isEmpty() ? null : cam; // "" resets to default
+            // Torch is the one setting that applies mid-stream: a reconnect for a fill
+            // light would blank the video. -1 (absent) keeps the current state.
+            int torch = intent.getIntExtra("torch", -1);
+            if (torch >= 0 && (torch != 0) != reqTorch) {
+                reqTorch = torch != 0;
+                camHandler.post(this::applyTorch);
+            }
+        }
+        return START_NOT_STICKY;
+    }
+
+    private boolean authorized(Intent intent) {
+        if (intent == null) return false;
+        String supplied = intent.getStringExtra("control_token");
+        if (supplied == null || supplied.isEmpty()) return false;
+        try (FileInputStream in = new FileInputStream(new File(getFilesDir(), TOKEN_FILE))) {
+            byte[] buffer = new byte[128];
+            int count = in.read(buffer);
+            if (count <= 0) return false;
+            String expected = new String(buffer, 0, count, StandardCharsets.UTF_8).trim();
+            return expected.length() >= 16 && expected.equals(supplied);
+        } catch (Exception error) {
+            return false;
+        }
+    }
+
+    private static int positiveOr(int v, int fallback) {
+        return v > 0 ? v : fallback;
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        if (sensorManager != null) {
+            sensorManager.unregisterListener(this);
+        }
+        // accept() only unblocks by closing the socket out from under it.
+        closeQuietly(server);
+        closeQuietly(orientationServer);
+        closeQuietly(controlServer);
+        camThread.quitSafely();
+        super.onDestroy();
+    }
+
+    /** One client at a time. The camera is held only while somebody is connected. */
+    private void serve() {
+        try {
+            server = new LocalServerSocket(SOCKET);
+            Log.i(TAG, "listening on localabstract:" + SOCKET);
+            while (running) {
+                LocalSocket sock = server.accept();
+                Log.i(TAG, "client connected");
+                connected = true;
+                lastClientAt = SystemClock.elapsedRealtime();
+                try {
+                    stream(sock);
+                } catch (Exception e) {
+                    Log.w(TAG, "stream ended: " + e);
+                } finally {
+                    connected = false;
+                    lastClientAt = SystemClock.elapsedRealtime();
+                    closeQuietly(sock);
+                }
+            }
+        } catch (IOException e) {
+            if (running) Log.e(TAG, "socket error", e);
+        } finally {
+            closeQuietly(server);
+            stopSelf();
+        }
+    }
+
+    private void watchIdle() {
+        while (running) {
+            SystemClock.sleep(5_000);
+            if (!running) return;
+            if (!connected
+                    && SystemClock.elapsedRealtime() - lastClientAt >= IDLE_TIMEOUT_MS) {
+                Log.i(TAG, "no host for " + IDLE_TIMEOUT_MS + " ms, stopping");
+                stopSelf();
+                return;
+            }
+        }
+    }
+
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        float x = event.values[0];
+        float y = event.values[1];
+        float z = event.values[2];
+        int rotation;
+        if (Math.abs(x) > Math.abs(y)) {
+            rotation = x > 0 ? 270 : 90;
+        } else {
+            rotation = y >= 0 ? 0 : 180;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastSensorLog >= 1000) {
+            lastSensorLog = now;
+            Log.i(TAG, "gravity x=" + x + " y=" + y + " z=" + z + " rot=" + rotation);
+        }
+        if (rotation != candidateRotation) {
+            candidateRotation = rotation;
+            candidateAt = now;
+        } else if (rotation != deviceRotation && now - candidateAt >= 500) {
+            deviceRotation = rotation;
+            Log.i(TAG, "device rotation " + rotation);
+        }
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+    }
+
+    private void serveOrientation() {
+        try {
+            orientationServer = new LocalServerSocket(ORIENTATION_SOCKET);
+            while (running) {
+                LocalSocket sock = orientationServer.accept();
+                try {
+                    OutputStream out = sock.getOutputStream();
+                    int last = -1;
+                    while (running) {
+                        int rotation = deviceRotation;
+                        if (rotation != last) {
+                            out.write((rotation + "\n").getBytes());
+                            out.flush();
+                            last = rotation;
+                        }
+                        Thread.sleep(150);
+                    }
+                } catch (Exception error) {
+                    Log.w(TAG, "orientation client ended: " + error);
+                } finally {
+                    closeQuietly(sock);
+                }
+            }
+        } catch (IOException error) {
+            if (running) Log.e(TAG, "orientation socket error", error);
+        } finally {
+            closeQuietly(orientationServer);
+        }
+    }
+
+    /**
+     * Host -> phone control channel. One line per command:
+     * {@code zoom=150} means 1.5x. It stays separate from the H.264 stream so a
+     * command cannot corrupt the video socket.
+     */
+    private void serveControl() {
+        try {
+            controlServer = new LocalServerSocket(CONTROL_SOCKET);
+            Log.i(TAG, "listening on localabstract:" + CONTROL_SOCKET);
+            while (running) {
+                LocalSocket sock = controlServer.accept();
+                try {
+                    BufferedReader reader =
+                            new BufferedReader(new InputStreamReader(sock.getInputStream()));
+                    String line;
+                    while (running && (line = reader.readLine()) != null) {
+                        line = line.trim();
+                        if (!line.startsWith("zoom")) continue;
+                        String digits = line.replaceAll("[^0-9]", "");
+                        if (digits.isEmpty()) continue;
+                        int percent;
+                        try {
+                            percent = Integer.parseInt(digits);
+                        } catch (NumberFormatException ignored) {
+                            continue;
+                        }
+                        final int value = Math.max(58, Math.min(1000, percent));
+                        camHandler.post(() -> applyZoom(value));
+                    }
+                } catch (Exception error) {
+                    Log.w(TAG, "control client ended: " + error);
+                } finally {
+                    closeQuietly(sock);
+                }
+            }
+        } catch (IOException error) {
+            if (running) Log.e(TAG, "control socket error", error);
+        } finally {
+            closeQuietly(controlServer);
+        }
+    }
+
+    private void stream(LocalSocket sock) throws Exception {
+        CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+        String id = pickCamera(mgr, reqCamera);
+        CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+        Size size = nearestSize(chars, reqWidth, reqHeight);
+        int fps = reqFps;
+        int bitrate = reqBitrate;
+        int zoom = reqZoom;
+        boolean highSpeed = fps > 30 && supportsHighSpeed(chars, size, fps);
+        if (highSpeed) {
+            bitrate = Math.max(bitrate, 20_000_000);
+        }
+        Log.i(TAG, "streaming " + size + "@" + fps + " " + bitrate + "bps zoom " + zoom
+                + "%" + (highSpeed ? " high-speed" : ""));
+
+        MediaFormat fmt = MediaFormat.createVideoFormat(MIME, size.getWidth(), size.getHeight());
+        fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+        fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrate);
+        fmt.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+        // 1s keyframes so a host that connects mid-stream syncs fast.
+        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+
+        MediaCodec codec = MediaCodec.createEncoderByType(MIME);
+        Surface surface = null;
+        CameraDevice cam = null;
+        try {
+            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            surface = codec.createInputSurface();
+            codec.start();
+            cam = openCamera(mgr, id, chars, surface, fps, zoom, highSpeed);
+            drain(codec, sock.getOutputStream());
+        } finally {
+            activeSession = null;
+            activeReq = null;
+            activeChars = null;
+            activeHighSpeed = false;
+            if (cam != null) cam.close(); // also tears down its capture session
+            try {
+                codec.stop();
+            } catch (Exception ignored) {
+            }
+            codec.release();
+            if (surface != null) surface.release();
+        }
+    }
+
+    /** Blocks until the camera is open and repeating into {@code surface}. */
+    private CameraDevice openCamera(CameraManager mgr, String id, CameraCharacteristics chars,
+            Surface surface, int fps, int zoom, boolean highSpeed) throws Exception {
+        Log.i(TAG, "opening camera " + id);
+
+        ArrayBlockingQueue<Object> opened = new ArrayBlockingQueue<>(1);
+        mgr.openCamera(id, new CameraDevice.StateCallback() {
+            @Override
+            public void onOpened(CameraDevice d) {
+                opened.offer(d);
+            }
+
+            @Override
+            public void onDisconnected(CameraDevice d) {
+                d.close();
+                opened.offer(new IOException("camera disconnected"));
+            }
+
+            @Override
+            public void onError(CameraDevice d, int err) {
+                d.close();
+                opened.offer(new IOException("camera error " + err));
+            }
+        }, camHandler);
+        CameraDevice cam = (CameraDevice) await(opened, "camera open");
+
+        try {
+            ArrayBlockingQueue<Object> configured = new ArrayBlockingQueue<>(1);
+            CameraCaptureSession.StateCallback callback =
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(CameraCaptureSession s) {
+                            configured.offer(s);
+                        }
+
+                        @Override
+                        public void onConfigureFailed(CameraCaptureSession s) {
+                            configured.offer(new IOException("capture session failed"));
+                        }
+                    };
+            if (highSpeed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                cam.createConstrainedHighSpeedCaptureSession(
+                        Collections.singletonList(surface), callback, camHandler);
+            } else {
+                cam.createCaptureSession(Collections.singletonList(surface), callback, camHandler);
+            }
+            CameraCaptureSession session =
+                    (CameraCaptureSession) await(configured, "capture session");
+
+            CaptureRequest.Builder req = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+            req.addTarget(surface);
+            if (highSpeed) {
+                req.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO);
+                req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<>(fps, fps));
+            } else {
+                Range<Integer> range = fpsRange(chars, fps);
+                if (range != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range);
+            }
+            applyZoomToRequest(req, chars, zoom);
+            Float dist = focusDistance(chars, reqFocus);
+            if (dist != null) {
+                req.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+                req.set(CaptureRequest.LENS_FOCUS_DISTANCE, dist);
+                Log.i(TAG, "focus fixed at " + dist + " diopters");
+            }
+            if (reqTorch) req.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH);
+            if (highSpeed) {
+                List<CaptureRequest> burst =
+                        ((CameraConstrainedHighSpeedCaptureSession) session)
+                                .createHighSpeedRequestList(req.build());
+                session.setRepeatingBurst(burst, null, camHandler);
+            } else {
+                session.setRepeatingRequest(req.build(), null, camHandler);
+            }
+            activeSession = session;
+            activeReq = req;
+            activeChars = chars;
+            activeHighSpeed = highSpeed;
+            return cam;
+        } catch (Exception e) {
+            cam.close();
+            throw e;
+        }
+    }
+
+    private void drain(MediaCodec codec, OutputStream out) throws IOException {
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        byte[] buf = new byte[64 * 1024];
+        while (running) {
+            int idx = codec.dequeueOutputBuffer(info, 500_000);
+            // <0 is TRY_AGAIN_LATER or FORMAT_CHANGED; SPS/PPS also arrive in-band as a
+            // CODEC_CONFIG buffer, so there is nothing to do for the format change.
+            if (idx < 0) continue;
+            try {
+                if (info.size > 0) {
+                    if (buf.length < info.size) buf = new byte[info.size];
+                    ByteBuffer bb = codec.getOutputBuffer(idx);
+                    bb.position(info.offset);
+                    bb.get(buf, 0, info.size);
+                    out.write(buf, 0, info.size); // encoder output is already Annex-B
+                }
+            } finally {
+                codec.releaseOutputBuffer(idx, false);
+            }
+            if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+        }
+        out.flush();
+    }
+
+    private static Object await(ArrayBlockingQueue<Object> q, String what) throws Exception {
+        Object r = q.poll(10, TimeUnit.SECONDS);
+        if (r == null) throw new IOException(what + " timed out");
+        if (r instanceof Exception) throw (Exception) r;
+        return r;
+    }
+
+    /** The requested id if the device has it, else the back camera (clamp, never fail). */
+    private static String pickCamera(CameraManager mgr, String wanted)
+            throws CameraAccessException, IOException {
+        if (wanted != null) {
+            // Logical camera ids are listed by getCameraIdList(); ultra-wide and
+            // telephoto lenses are often hidden physical ids. Camera2 still accepts
+            // those ids on many devices, so try the requested id directly first.
+            try {
+                mgr.getCameraCharacteristics(wanted);
+                return wanted;
+            } catch (Exception error) {
+                Log.w(TAG, "no camera " + wanted + ", falling back to back camera");
+            }
+        }
+        return backCameraId(mgr);
+    }
+
+    private static String backCameraId(CameraManager mgr) throws CameraAccessException, IOException {
+        String[] ids = mgr.getCameraIdList();
+        if (ids.length == 0) throw new IOException("no cameras");
+        for (String id : ids) {
+            Integer facing = mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING);
+            if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) return id;
+        }
+        return ids[0];
+    }
+
+    /** Nearest supported AE range to {@code fps}, or null to leave the camera on auto. */
+    private static Range<Integer> fpsRange(CameraCharacteristics chars, int fps) {
+        Range<Integer>[] ranges =
+                chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges == null) return null;
+        Range<Integer> best = null;
+        for (Range<Integer> r : ranges) {
+            if (r.getUpper() != fps) continue;
+            if (best == null || r.getLower() > best.getLower()) best = r; // prefer fixed fps-fps
+        }
+        return best;
+    }
+
+    private static boolean supportsHighSpeed(CameraCharacteristics chars, Size size, int fps) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false;
+        StreamConfigurationMap map =
+                chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        if (map == null) return false;
+        for (Size candidate : map.getHighSpeedVideoSizes()) {
+            if (candidate.getWidth() != size.getWidth()
+                    || candidate.getHeight() != size.getHeight()) {
+                continue;
+            }
+            for (Range<Integer> range : map.getHighSpeedVideoFpsRangesFor(candidate)) {
+                if (fps >= range.getLower() && fps <= range.getUpper()) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Re-issues the repeating request with the current torch state; no-op while idle. */
+    private void applyTorch() {
+        CameraCaptureSession session = activeSession;
+        CaptureRequest.Builder req = activeReq;
+        if (session == null || req == null) return;
+        try {
+            req.set(CaptureRequest.FLASH_MODE, reqTorch
+                    ? CaptureRequest.FLASH_MODE_TORCH : CaptureRequest.FLASH_MODE_OFF);
+            session.setRepeatingRequest(req.build(), null, camHandler);
+            Log.i(TAG, "torch " + (reqTorch ? "on" : "off"));
+        } catch (Exception e) {
+            Log.w(TAG, "torch update failed: " + e); // session torn down mid-post
+        }
+    }
+
+    /** Applies a new digital zoom to the live repeating request, if a stream is active. */
+    private void applyZoom(int percent) {
+        int value = Math.max(58, percent);
+        reqZoom = value;
+        CameraCaptureSession session = activeSession;
+        CaptureRequest.Builder req = activeReq;
+        CameraCharacteristics chars = activeChars;
+        if (session == null || req == null || chars == null) return;
+        try {
+            applyZoomToRequest(req, chars, value);
+            if (activeHighSpeed
+                    && session instanceof CameraConstrainedHighSpeedCaptureSession) {
+                List<CaptureRequest> burst =
+                        ((CameraConstrainedHighSpeedCaptureSession) session)
+                                .createHighSpeedRequestList(req.build());
+                session.setRepeatingBurst(burst, null, camHandler);
+            } else {
+                session.setRepeatingRequest(req.build(), null, camHandler);
+            }
+            Log.i(TAG, "zoom " + value + "%");
+        } catch (Exception e) {
+            Log.w(TAG, "zoom update failed: " + e); // session torn down mid-post
+        }
+    }
+
+    /**
+     * Fixed focus distance in diopters (0 = infinity, 2.0 = 50cm), clamped to the lens's
+     * closest focus, or null to keep continuous autofocus — when {@code focus} is
+     * negative (the default) or the device can't do manual focus (LEGACY devices only
+     * list AF_MODE_OFF for fixed-focus lenses). Clamp, never fail.
+     */
+    private static Float focusDistance(CameraCharacteristics chars, float focus) {
+        if (focus < 0) return null;
+        int[] modes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES);
+        boolean off = false;
+        if (modes != null) {
+            for (int m : modes) off |= m == CaptureRequest.CONTROL_AF_MODE_OFF;
+        }
+        if (!off) {
+            Log.w(TAG, "manual focus unsupported, keeping autofocus");
+            return null;
+        }
+        Float min = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+        return Math.min(focus, min == null ? 0f : min);
+    }
+
+    /**
+     * Android 11+ exposes CONTROL_ZOOM_RATIO, which lets a logical multi-camera
+     * choose an ultra-wide physical lens below 1x. Older devices only have the
+     * crop-region path.
+     */
+    private static void applyZoomToRequest(CaptureRequest.Builder req,
+            CameraCharacteristics chars, int zoom) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            req.set(CaptureRequest.CONTROL_ZOOM_RATIO, Math.max(0.1f, zoom / 100f));
+            return;
+        }
+        Rect crop = zoomCrop(chars, zoom);
+        if (crop != null) req.set(CaptureRequest.SCALER_CROP_REGION, crop);
+    }
+
+    /**
+     * Digital zoom: centered crop of the active sensor array, {@code zoom} in percent
+     * (150 = 1.5x), clamped to the camera's max digital zoom. Null at 100% or below —
+     * SCALER_CROP_REGION is (0,0)-origin in active-array coordinates. CONTROL_ZOOM_RATIO
+     * would be cleaner but needs API 30; the phones this app exists for are older.
+     */
+    private static Rect zoomCrop(CameraCharacteristics chars, int zoom) {
+        Rect active = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        if (active == null) return null;
+        if (zoom <= 100) return active;
+        Float max = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+        float z = Math.min(zoom / 100f, max == null ? 1f : max);
+        if (z <= 1f) return active;
+        int w = Math.round(active.width() / z);
+        int h = Math.round(active.height() / z);
+        int x = (active.width() - w) / 2;
+        int y = (active.height() - h) / 2;
+        return new Rect(x, y, x + w, y + h);
+    }
+
+    /** The requested size if the camera offers it, else the supported size nearest by area. */
+    private static Size nearestSize(CameraCharacteristics chars, int w, int h) {
+        StreamConfigurationMap map =
+                chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size[] sizes = map == null ? null : map.getOutputSizes(MediaCodec.class);
+        if (sizes == null || sizes.length == 0) return new Size(w, h); // let the camera decide
+        long want = (long) w * h;
+        Size best = sizes[0];
+        long bestDiff = Long.MAX_VALUE;
+        for (Size s : sizes) {
+            // ponytail: nearest by area only; weigh aspect ratio in if a host ever needs it
+            long diff = Math.abs((long) s.getWidth() * s.getHeight() - want);
+            if (diff < bestDiff) {
+                best = s;
+                bestDiff = diff;
+            }
+        }
+        return best;
+    }
+
+    /**
+     * The probe channel: `adb shell dumpsys activity service <this>/.CamService` prints
+     * one line of JSON — cameras with id/facing/orientation/maxZoom/sizes/fpsRanges — for
+     * the host to build a real picker from. Reading characteristics needs no CAMERA
+     * grant, so this works even when streaming would not. The stream socket stays pure
+     * H.264; this is the only reply channel there is.
+     */
+    @Override
+    protected void dump(FileDescriptor fd, PrintWriter writer, String[] args) {
+        try {
+            CameraManager mgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+            JSONArray cameras = new JSONArray();
+            for (String id : mgr.getCameraIdList()) {
+                CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+                JSONObject cam = new JSONObject();
+                cam.put("id", id);
+                cam.put("facing", facingName(chars.get(CameraCharacteristics.LENS_FACING)));
+                Integer orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+                cam.put("orientation", orientation == null ? 0 : orientation);
+                Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+                cam.put("maxZoom", maxZoom == null ? 1.0 : (double) maxZoom);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    Range<Float> zoomRange =
+                            chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+                    cam.put("zoomMin", zoomRange == null ? 1.0 : (double) zoomRange.getLower());
+                    cam.put("zoomMax", zoomRange == null ? 1.0 : (double) zoomRange.getUpper());
+                } else {
+                    cam.put("zoomMin", 1.0);
+                    cam.put("zoomMax", maxZoom == null ? 1.0 : (double) maxZoom);
+                }
+                JSONArray physical = new JSONArray();
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    for (String pid : chars.getPhysicalCameraIds()) physical.put(pid);
+                }
+                cam.put("physicalIds", physical);
+                // Upper bound for a host's focus slider, diopters; 0 = fixed-focus lens.
+                Float minFocus = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+                cam.put("minFocusDistance", minFocus == null ? 0.0 : (double) minFocus);
+                JSONArray sizes = new JSONArray();
+                for (Size s : encoderSizes(chars)) sizes.put(s.getWidth() + "x" + s.getHeight());
+                cam.put("sizes", sizes);
+                JSONArray fpsRanges = new JSONArray();
+                Range<Integer>[] ranges =
+                        chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+                if (ranges != null) {
+                    for (Range<Integer> r : ranges) {
+                        fpsRanges.put(new JSONArray().put(r.getLower()).put(r.getUpper()));
+                    }
+                }
+                cam.put("fpsRanges", fpsRanges);
+                cameras.put(cam);
+            }
+            // OEMs often hide ultra-wide/telephoto cameras from getCameraIdList().
+            // Probe ids 0..9 so the host can see whether they are at least readable.
+            for (int hiddenId = 0; hiddenId < 10; hiddenId++) {
+                String id = String.valueOf(hiddenId);
+                boolean listed = false;
+                for (String known : mgr.getCameraIdList()) {
+                    if (known.equals(id)) listed = true;
+                }
+                if (listed) continue;
+                try {
+                    CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+                    JSONObject cam = new JSONObject();
+                    cam.put("id", id);
+                    cam.put("hidden", true);
+                    cam.put("facing", facingName(chars.get(CameraCharacteristics.LENS_FACING)));
+                    Integer orientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+                    cam.put("orientation", orientation == null ? 0 : orientation);
+                    Float maxZoom =
+                            chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+                    cam.put("maxZoom", maxZoom == null ? 1.0 : (double) maxZoom);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        Range<Float> zoomRange =
+                                chars.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
+                        cam.put("zoomMin",
+                                zoomRange == null ? 1.0 : (double) zoomRange.getLower());
+                        cam.put("zoomMax",
+                                zoomRange == null ? 1.0 : (double) zoomRange.getUpper());
+                    }
+                    JSONArray sizes = new JSONArray();
+                    for (Size s : encoderSizes(chars)) {
+                        sizes.put(s.getWidth() + "x" + s.getHeight());
+                    }
+                    cam.put("sizes", sizes);
+                    cameras.put(cam);
+                } catch (Exception ignored) {
+                    // not exposed to third-party apps
+                }
+            }
+
+            // Requested vs what the clamps would apply right now, so the host can read
+            // back the real stream parameters (e.g. ffmpeg's -r) before connecting.
+            JSONObject requested = new JSONObject()
+                    .put("camera", reqCamera == null ? JSONObject.NULL : reqCamera)
+                    .put("width", reqWidth).put("height", reqHeight)
+                    .put("fps", reqFps).put("bitrate", reqBitrate)
+                    .put("zoom", reqZoom).put("torch", reqTorch)
+                    .put("focus", reqFocus < 0 ? JSONObject.NULL : (double) reqFocus);
+            String id = pickCamera(mgr, reqCamera);
+            CameraCharacteristics chars = mgr.getCameraCharacteristics(id);
+            Size size = nearestSize(chars, reqWidth, reqHeight);
+            Range<Integer> range = fpsRange(chars, reqFps);
+            Float maxZoom = chars.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+            int zoom = Math.max(100, Math.round(
+                    Math.min(reqZoom / 100f, maxZoom == null ? 1f : maxZoom) * 100));
+            Float dist = focusDistance(chars, reqFocus);
+            JSONObject applied = new JSONObject()
+                    .put("camera", id)
+                    .put("width", size.getWidth()).put("height", size.getHeight())
+                    // fpsAuto: no AE range matched, the camera paces itself — fps is
+                    // then the encoder hint, not a promise.
+                    .put("fps", reqFps).put("fpsAuto", range == null)
+                    .put("zoom", zoom).put("torch", reqTorch)
+                    .put("focus", dist == null ? JSONObject.NULL : (double) dist);
+
+            writer.println(new JSONObject()
+                    .put("cameras", cameras)
+                    .put("requested", requested)
+                    .put("applied", applied)
+                    .put("connected", connected)
+                    .toString());
+        } catch (Exception e) {
+            writer.println("probe failed: " + e);
+        }
+    }
+
+    private static String facingName(Integer facing) {
+        if (facing == null) return "external";
+        switch (facing) {
+            case CameraCharacteristics.LENS_FACING_FRONT: return "front";
+            case CameraCharacteristics.LENS_FACING_BACK: return "back";
+            default: return "external";
+        }
+    }
+
+    /** Encoder-capable output sizes, descending by area; empty if the map is missing. */
+    private static Size[] encoderSizes(CameraCharacteristics chars) {
+        StreamConfigurationMap map =
+                chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        Size[] sizes = map == null ? null : map.getOutputSizes(MediaCodec.class);
+        if (sizes == null) return new Size[0];
+        java.util.Arrays.sort(sizes, (a, b) -> Long.compare(
+                (long) b.getWidth() * b.getHeight(), (long) a.getWidth() * a.getHeight()));
+        return sizes;
+    }
+
+    private Notification notification() {
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager.class).createNotificationChannel(
+                    new NotificationChannel(TAG, "Камера Android", NotificationManager.IMPORTANCE_LOW));
+            b = new Notification.Builder(this, TAG);
+        } else {
+            b = new Notification.Builder(this);
+        }
+        return b.setContentTitle("Камера Android")
+                .setContentText("Трансляция камеры на компьютер")
+                .setSmallIcon(android.R.drawable.ic_menu_camera)
+                .build();
+    }
+
+    private static void closeQuietly(Object c) {
+        try {
+            if (c instanceof LocalServerSocket) ((LocalServerSocket) c).close();
+            else if (c instanceof LocalSocket) ((LocalSocket) c).close();
+        } catch (IOException ignored) {
+        }
+    }
+}

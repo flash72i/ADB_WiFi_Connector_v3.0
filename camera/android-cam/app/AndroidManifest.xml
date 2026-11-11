@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.officialdad.androidcam">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+    <application android:label="ADB Android" android:icon="@drawable/ic_launcher"
+        android:debuggable="true">
+        <!-- No activity. The host starts the services through `run-as`, so they stay
+             non-exported: no other app can start the camera or microphone. -->
+        <service
+            android:name=".CamService"
+            android:label="Камера Android"
+            android:exported="true"
+            android:foregroundServiceType="camera" />
+        <service
+            android:name=".AudioService"
+            android:label="Микрофон Android"
+            android:exported="true"
+            android:foregroundServiceType="microphone" />
+    </application>
+</manifest>

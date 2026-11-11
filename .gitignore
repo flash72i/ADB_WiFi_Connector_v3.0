@@ -11,8 +11,8 @@ __pycache__/
 *.pyc
 
 # Build artifacts
-release/
-APP/
+/release/
+/APP/
 installer/bin/*
 !installer/bin/icon.ico
 
