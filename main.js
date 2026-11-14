@@ -3409,7 +3409,7 @@ const map = {
         if (apkSize > 300 * 1024 * 1024) continue;
         const key = pkg.replace(/[^a-z0-9._]/gi, '_') + '-' + Math.abs(apk.split('/').pop().length);
         const tmp = path.join(os.tmpdir(), 'icon-' + serialTag(serial) + '-' + key + '.apk');
-        const pr = await adb.run(['-s', serial, 'pull', apk, tmp], { timeout: 240000 });
+        const pr = await pullApkFile(serial, apk, tmp);
         if (!pr.ok) continue;
         let apkBuf;
         try { apkBuf = fs.readFileSync(tmp); } catch (e) { apkBuf = null; }
