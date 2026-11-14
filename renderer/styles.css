@@ -1546,3 +1546,21 @@ body.mini-win #mini-body { flex: 1; }
 }
 .rail-theme:hover { background: var(--surface-3); border-color: var(--accent); }
 .rail-theme:active { transform: scale(.94); }
+
+/* Apps: заголовок и подложка закрывают верхний padding #content */
+#page-apps .page-head {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--surface-solid);
+}
+#page-apps .page-head::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: 22px;
+  background: var(--surface-solid);
+}
+#page-apps .apps-sticky { top: 41px; }
