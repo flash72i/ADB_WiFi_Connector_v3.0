@@ -3089,6 +3089,23 @@ const map = {
     return { ok: r.ok, message: message || (r.ok ? 'Журналы очищены' : 'Не удалось очистить журналы') };
   });
   ipcMain.handle('apps:audit', async (_e, serial, pkg) => appaudit.collect(serial, pkg));
+  // На части устройств adbd не читает /data/app напрямую: shell видит файл,
+  // а adb pull отвечает «remote object does not exist». Копируем через shell
+  // в /sdcard/Download и забираем оттуда, затем удаляем временный файл.
+  async function pullApkFile(serial, remote, dest) {
+    const direct = await adb.run(['-s', serial, 'pull', remote, dest], { timeout: 600000 }).catch(() => null);
+    if (direct && direct.ok) return direct;
+    const tmp = '/sdcard/Download/.adbwc-' + Date.now() + '-' + process.pid + '-' + Math.random().toString(36).slice(2, 8) + '.apk';
+    const cp = await adb.run(['-s', serial, 'shell', 'cp', remote, tmp], { timeout: 60000 }).catch(() => null);
+    if (!cp || !cp.ok) return direct || cp;
+    try {
+      const pulled = await adb.run(['-s', serial, 'pull', tmp, dest], { timeout: 600000 }).catch(() => null);
+      if (pulled && pulled.ok) return pulled;
+      return pulled || direct;
+    } finally {
+      await adb.run(['-s', serial, 'shell', 'rm', '-f', tmp], { timeout: 15000 }).catch(() => null);
+    }
+  }
   ipcMain.handle('apps:backup', async (_e, serial, pkgs) => {
     const dir = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] });
     if (dir.canceled) return { ok: false, canceled: true };
@@ -3098,7 +3115,7 @@ const map = {
       const apk = (p.stdout.match(/package:(\S+)/) || [])[1];
       if (!apk) continue;
       const dest = path.join(dir.filePaths[0], pkg + '.apk');
-      const r = await adb.run(['-s', serial, 'pull', apk, dest], { timeout: 300000 });
+      const r = await pullApkFile(serial, apk, dest);
       if (r.ok) done++;
     }
     return { ok: done > 0, done, total: pkgs.length, dir: dir.filePaths[0] };
@@ -3107,7 +3124,7 @@ const map = {
   ipcMain.handle('apps:saveapk', async (_e, serial, pkg, label) => {
     const p = await adb.run(['-s', serial, 'shell', 'pm', 'path', pkg], { timeout: 15000 }).catch(() => null);
     const apk = ((p && p.stdout) || '').match(/package:(\S+)/);
-    if (!apk) return { ok: false, error: 'APK пакета не найден на телефоне' };
+    if (!apk) return { ok: false, error: 'APK пакета не найден на устройстве' };
     const d = await adb.run(['-s', serial, 'shell', 'dumpsys', 'package', pkg], { timeout: 15000 }).catch(() => null);
     const vn = (((d && d.stdout) || '').match(/versionName=(\S+)/) || [])[1] || '';
     const base = String(label || pkg).replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim() || pkg;
@@ -3115,7 +3132,7 @@ const map = {
     const res = await dialog.showSaveDialog(win, { title: 'Сохранить приложение на ПК', defaultPath: def, filters: [{ name: 'APK', extensions: ['apk'] }] });
     if (res.canceled || !res.filePath) return { ok: false, canceled: true };
     const dest = /\.apk$/i.test(res.filePath) ? res.filePath : res.filePath + '.apk';
-    const r = await adb.run(['-s', serial, 'pull', apk[1], dest], { timeout: 600000 }).catch(() => null);
+    const r = await pullApkFile(serial, apk[1], dest);
     if (!r || !r.ok) return { ok: false, error: ((r && r.stderr) || '').slice(0, 200) || 'не удалось скопировать файл' };
     return { ok: true, path: dest };
   });
