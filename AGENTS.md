@@ -4,6 +4,9 @@
 Читать целиком перед правками. Все пути ниже — относительно этой папки (`ADB_WiFi_Connector_v3.0`),
 если не указано иное.
 
+Продолжаете прерванную работу или потеряли контекст — начните с `AGENT-CONTINUATION.md`
+(краткая карта и порядок обновления GitHub), затем возвращайтесь сюда.
+
 ## 1. Что это за проект
 
 - **Приложение**: Electron-программа «ADB Wi-Fi Коннектор» для Windows x64 —
@@ -45,6 +48,7 @@ ADB_WiFi_Connector_v3.0/
     ADB_WiFi_Connector_v3.0.exe   готовый установщик (128 МБ)
 
   AGENTS.md               этот файл
+  AGENT-CONTINUATION.md   краткая памятка: с чего начать и как обновлять GitHub
   .gitignore
   .gitattributes          Git LFS для exe/dll/zip
 ```
@@ -165,7 +169,7 @@ $zip = [System.IO.Compression.ZipFile]::Open(
 $zip.Dispose()
 ```
 
-Ожидается 143 записи, ~126 МБ; в корне ZIP — `APP/`, лаунчер, `README-RU.md`,
+Ожидается 192 записи, 133 970 040 байт (~128 МБ); в корне ZIP — `APP/`, лаунчер, `README-RU.md`,
 `Uninstall.exe`. Никаких `Сохранения/`, `app.log`, `config.json` там быть не должно.
 
 ### 6.4. Финальный EXE
@@ -206,7 +210,7 @@ Copy-Item "$BIN\SetupTest.exe" $test -Force
 & $test /extract "$env:TEMP\adbwifi-check"
 ```
 
-Ожидается: 133 файла, ~306 МБ, `APP\resources\app\package.json` с `"version": "3.0"`,
+Ожидается: 176 файлов, ~310 МБ, `APP\resources\app\package.json` с `"version": "3.0"`,
 `README-RU.md` с заголовком «версия 3.0». После проверки временную папку удалить.
 
 ## 7. Выпуск новой версии (например, 3.1)
@@ -251,7 +255,7 @@ Get-ChildItem -Recurse -File -Include *.js,*.html,*.json,*.md,*.cs,*.txt,*.c,*.r
 - **Git LFS**: `.gitattributes` отправляет `*.exe`, `*.dll`, `*.zip` в LFS.
   Один раз выполнить `git lfs install`. GitHub не принимает файлы >100 МБ
   обычным способом; LFS-квота бесплатного аккаунта — 1 ГБ хранилища и трафика.
-  В репозитории ~126 МБ LFS: `release\...Setup.exe`. `payload.zip` создаётся
+  В репозитории ~128 МБ LFS: `release\...Setup.exe`. `payload.zip` создаётся
   при сборке и в git не хранится (исключён в `.gitignore`).
 - **APP не дублируется** в репозитории: он уже внутри `release\...Setup.exe`
   и лежит в родительской папке для сборки. Если понадобится положить APP в git —
@@ -264,7 +268,7 @@ Get-ChildItem -Recurse -File -Include *.js,*.html,*.json,*.md,*.cs,*.txt,*.c,*.r
 - [ ] Окно по центру; X закрывает сразу; лицензия открывается/закрывается.
 - [ ] Иконка в панели задач совпадает с иконкой программы.
 - [ ] Портативный путь по умолчанию — рядом с установщиком.
-- [ ] `/extract` даёт 133 файла / ~306 МБ; версия в `package.json` — 3.0.
+- [ ] `/extract` даёт 176 файлов / ~310 МБ; версия в `package.json` — 3.0.
 - [ ] В `payload.zip` нет `Сохранения/`, `app.log`, `config.json`.
 - [ ] Поиск личных данных (раздел 8) ничего не находит.
 - [ ] SHA-256 финального EXE записан в ответ/README.
