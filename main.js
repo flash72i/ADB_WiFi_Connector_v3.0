@@ -427,8 +427,17 @@ async function autoPairConnect(host, code, hintPort) {
   // сначала пробуем соседние порты (мгновенно), затем быстрый свип
   const after = [];
   for (const p of [pairPort + 1, pairPort - 1, pairPort + 2]) if (p > 1024) after.push(p);
+  // mDNS `_adb-tls-connect` — самый точный источник порта отладки: быстрый свип с ранним
+  // выходом может поймать «мёртвый» порт прошлой сессии и не дойти до настоящего
+  const mdnsPorts = [];
+  try {
+    const am = await adb.mdnsServices();
+    for (const r of (am.items || [])) {
+      if (r.host === host && r.port && String(r.service || '').includes('_adb-tls-connect')) mdnsPorts.push(r.port);
+    }
+  } catch (e) {}
   const swept = await adb.portScanFast(host);
-  const connPorts = after.concat(swept).filter((p, i, a) => p !== pairPort && a.indexOf(p) === i);
+  const connPorts = after.concat(mdnsPorts, swept).filter((p, i, a) => p !== pairPort && a.indexOf(p) === i);
   if (!connPorts.length) connPorts.push(5555);
   for (const p of connPorts) {
     // подключаем через ЕДИНУЮ точку: rememberDevice + трей (R8)
@@ -1501,8 +1510,12 @@ if (key === 'autostart') return setAutostart(!!value);
       hintHost,
       sendStatus: (stage, message, extra) => sendTask(Object.assign({ kind: 'qr-status', stage, message }, extra || {})),
       onConnected: (host, port, model) => {
-        // R8: подключение через единую точку (enforce одного устройства внутри)
-        connectDevice(host, port, { model }).then(() => sendTask({ kind: 'refresh-devices' }));
+        // R8: подключение через единую точку (enforce одного устройства внутри).
+        // Возвращаем результат: qrpair покажет «Подключено» только после реальной проверки online.
+        return connectDevice(host, port, { model }).then(r => {
+          if (r && r.ok) sendTask({ kind: 'refresh-devices' });
+          return r;
+        });
       },
       log: () => {} // qr-журнал отладочный: в app.log попадают ТОЛЬКО ошибки (F19)
     });

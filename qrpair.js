@@ -208,85 +208,141 @@ async function run(s, deps) {
     return;
   }
   const [host, portStr] = serial.split(':');
+  const port = parseInt(portStr, 10) || 5555;
   let model = '';
   try { model = (await adb.modelName(serial)).model; } catch (e) {}
+  if (s.cancelled) return;
+  // подтверждение через main (единая точка connectDevice ещё раз проверяет online):
+  // раньше «connected» уходил в интерфейс ДО этой проверки, и при «мёртвом» порте
+  // пользователь видел «Подключено», но устройства в списке не было
+  let confirmed = true;
+  try {
+    const r = deps.onConnected ? await deps.onConnected(host, port, model) : null;
+    if (r && r.ok === false) confirmed = false;
+  } catch (e) { confirmed = false; }
+  if (s.cancelled) return;
   s.finished = true;
-  sendStatus('connecting', 'Подключено: ' + serial);
-  try { deps.onConnected && deps.onConnected(host, parseInt(portStr, 10) || 5555, model); } catch (e) {}
-  sendStatus('connected', 'Подключено: ' + (model || serial), { host, port: parseInt(portStr, 10) || 5555, model });
+  if (!confirmed) {
+    sendStatus('error', 'Сопряжение выполнено, но устройство не вышло на связь. Откройте на телефоне «Беспроводную отладку» и повторите подключение по QR («Другой код»).');
+    return;
+  }
+  sendStatus('connected', 'Подключено: ' + (model || serial), { host, port, model });
 }
 
-// фаза подключения ПОСЛЕ сопряжения переписана: свип портов стартует ПЕРВЫМ ДЕЛОМ
-// с ранним выходом, параллельно опрашивается adb devices (автоподключение), найденные порты
-// пробуются немедленно.
-// сразу после сопряжения пробуем СОСЕДНИЕ порты (порт отладки часто = порт сопряжения
-// ±1) — это даёт подключение за ~0,5 с, не дожидаясь свипа, и полл adb devices идёт с ними параллельно.
+// фаза подключения после сопряжения переписана ещё раз: раньше свип портов
+// запускался с РАННИМ ВЫХОДОМ, и первый же открытый порт (им часто оказывался
+// «мёртвый» порт прошлой сессии — TCP ещё принимает, TLS уже нет) обрывал поиск
+// ДО настоящего порта отладки. `adb connect` на такой порт отвечает «already
+// connected», код считал это успехом: интерфейс писал «Подключено», а устройства
+// в списке не было (жалоба владельца «QR не добавляет устройство»).
+// Теперь кандидаты собираются параллельно и КАЖДЫЙ проверяется по состоянию online:
+//   1) mDNS `_adb-tls-connect` (`adb mdns services` + свой клиент) — самый точный;
+//   2) полный свип диапазона без раннего выхода, каждый открытый порт проверяется сразу;
+//   3) соседние с портом сопряжения порты (Android нередко выделяет их подряд);
+//   4) `adb devices` — на случай, если adb подключился сам.
 async function connectPhase(s, host, pairPort, log) {
   const t0 = Date.now();
   let stopped = false;
   let serial = null;
-  // (1) быстрый свип портов — запускаем сразу, он и есть главный источник кандидатов
-  const scanP = adb.portScanFast(host).catch(() => []);
-  // (2) параллельно: adb мог уже сам подключить устройство после сопряжения
-  const pollP = (async () => {
-    while (!stopped && !s.cancelled && !serial && Date.now() - t0 < CONNECT_TIMEOUT_MS) {
-      const d = await adb.devices().catch(() => ({ ok: false, list: [] }));
-      for (const dev of (d.list || [])) {
-        if (dev.state === 'device' && dev.serial.startsWith(host + ':')) return dev.serial;
-      }
-      await sleep(800);
-    }
-    return null;
-  })();
-  const tried = new Set();
-  const tryPort = async (p) => {
-    if (!p || tried.has(p)) return null;
-    tried.add(p);
-    try {
-      const c = await adb.connect(host, p);
-      if (c.ok) return host + ':' + p;
-    } catch (e) {}
-    return null;
+  const tries = new Map(); // port -> { p, t, result }
+
+  const online = async (port) => {
+    const want = host + ':' + port;
+    const d = await adb.devices().catch(() => ({ list: [] }));
+    const dev = (d.list || []).find(x => x.serial === want);
+    return !!dev && dev.state === 'device';
   };
-  // (3) соседние порты — мгновенный кандидат
-  if (pairPort) {
-    await Promise.race([pollP.then(r => { if (r) serial = r; }), sleep(350)]);
-    if (!serial) for (const p of [pairPort + 1, pairPort - 1, pairPort + 2]) {
-      if (s.cancelled) return null;
-      serial = await tryPort(p);
-      if (serial) break;
+
+  const tryPort = (p) => {
+    p = parseInt(p, 10);
+    if (!p || p < 1 || p > 65535) return Promise.resolve(null);
+    const now = Date.now();
+    const prev = tries.get(p);
+    if (prev) {
+      if (prev.result) return Promise.resolve(null);
+      // порт мог ещё не принимать соединения сразу после сопряжения — повторяем позже
+      if (now - prev.t < 1500) return prev.p;
     }
-  }
-  // ГОНКА источников: кто первый даст рабочий serial — тот и выигрывает
-  while (!s.cancelled && !serial && Date.now() - t0 < CONNECT_TIMEOUT_MS) {
-    const winner = await Promise.race([
-      pollP.then(r => (r ? { type: 'poll', serial: r } : null)),
-      scanP.then(ports => ({ type: 'scan', ports })),
-      sleep(500).then(() => null)
-    ]);
-    if (!winner) continue;
-    if (winner.type === 'poll' && winner.serial) { serial = winner.serial; break; }
-    // scan: перебираем найденные порты (обычно 1–2)
-    for (const p of (winner.ports || [])) {
-      serial = await tryPort(p);
-      if (serial || s.cancelled) break;
+    const entry = { t: now, result: null, p: null };
+    entry.p = (async () => {
+      if (serial || s.cancelled || stopped) return null;
+      const c = await adb.connect(host, p).catch(() => ({ ok: false }));
+      if (!c || !c.ok) return null;
+      // ответ «connected to» ещё не значит online: устаревший порт принимает TCP,
+      // но TLS-сессия не поднимается. Ждём состояние device.
+      for (const delay of [300, 500, 800, 1200]) {
+        if (s.cancelled) return null;
+        await sleep(delay);
+        if (await online(p)) return host + ':' + p;
+        if (serial || stopped) break;
+      }
+      try { await adb.disconnect(host + ':' + p); } catch (e) {}
+      return null;
+    })().then(r => { entry.result = r; return r; }, () => null);
+    tries.set(p, entry);
+    return entry.p;
+  };
+
+  const adopt = async (ports) => {
+    for (const p of (ports || [])) {
+      if (s.cancelled || stopped || serial) return;
+      const r = await tryPort(p);
+      if (r) { serial = r; return; }
     }
-    if (!serial && winner.type === 'scan' && !(winner.ports || []).length) {
-      // свип ничего не нашёл — пробуем mDNS-порт отладки напрямую
-      const recs = await mdns.discover(700).catch(() => []);
-      const all = (recs || []).concat((await adb.mdnsServices().catch(() => ({ items: [] }))).items || []);
-      const conn = all.find(r => String(r.service || '').includes('_adb-tls-connect') && r.host === host && r.port);
-      if (conn) serial = await tryPort(conn.port);
+  };
+
+  // 0) соседние с портом сопряжения — кандидат, но НЕ блокирующий: connect к закрытому
+  //    порту на Windows занимает ~2 с, а mDNS отдаёт точный порт за ~40 мс
+  const neighborsDone = pairPort
+    ? adopt([pairPort + 1, pairPort - 1, pairPort + 2])
+    : Promise.resolve();
+
+  // 1) mDNS: слушаем весь таймаут — телефон публикует `_adb-tls-connect` через 1–3 с
+  //    после сопряжения, один ранний запрос его не заставал
+  const mdnsLoop = (async () => {
+    while (!s.cancelled && !stopped && !serial && Date.now() - t0 < CONNECT_TIMEOUT_MS) {
+      const ports = [];
+      try {
+        const am = await adb.mdnsServices();
+        for (const r of (am.items || [])) {
+          if (String(r.service || '').includes('_adb-tls-connect') && r.host === host && r.port) ports.push(r.port);
+        }
+      } catch (e) {}
+      try {
+        const recs = await mdns.discover(800).catch(() => []);
+        for (const r of (recs || [])) {
+          if (String(r.service || '').includes('_adb-tls-connect') && r.host === host && r.port) ports.push(r.port);
+        }
+      } catch (e) {}
+      await adopt(ports);
+      if (!serial) await sleep(300);
     }
-    if (winner.type === 'scan') {
-      // свип завершён; ждём только poll до конца таймаута
-      const r = await Promise.race([pollP, sleep(Math.max(0, CONNECT_TIMEOUT_MS - (Date.now() - t0))).then(() => null)]);
-      serial = r || serial;
-      break;
+  })().catch(() => {});
+
+  // 2) полный свип диапазона без раннего выхода: каждый открытый порт проверяется сразу
+  const scanDone = adb.portRangeScan(host, 32768, 60999, 420, 320, {
+    onFound: (p) => { if (!s.cancelled && !serial) tryPort(p); },
+    shouldStop: () => !!serial || s.cancelled || stopped
+  }).catch(() => []);
+
+  // 3) `adb devices` — вдруг adb подключился сам
+  const pollLoop = (async () => {
+    while (!s.cancelled && !stopped && !serial && Date.now() - t0 < CONNECT_TIMEOUT_MS) {
+      const d = await adb.devices().catch(() => ({ list: [] }));
+      for (const dev of (d.list || [])) {
+        if (dev.state === 'device' && String(dev.serial).startsWith(host + ':')) { serial = dev.serial; return; }
+      }
+      await sleep(700);
     }
+  })().catch(() => {});
+
+  while (!s.cancelled && !stopped && !serial && Date.now() - t0 < CONNECT_TIMEOUT_MS) {
+    await sleep(200);
   }
   stopped = true;
+  if (serial) return serial;
+  await Promise.race([Promise.allSettled([neighborsDone, mdnsLoop, pollLoop, scanDone]), sleep(1500)]);
   return serial;
 }
 
-module.exports = { start, cancel, isRunning };
+module.exports = { start, cancel, isRunning, _connectPhase: connectPhase };

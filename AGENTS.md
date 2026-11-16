@@ -169,7 +169,7 @@ $zip = [System.IO.Compression.ZipFile]::Open(
 $zip.Dispose()
 ```
 
-Ожидается 192 записи, 133 970 040 байт (~128 МБ); в корне ZIP — `APP/`, лаунчер, `README-RU.md`,
+Ожидается 192 записи, 133 971 211 байт (~128 МБ); в корне ZIP — `APP/`, лаунчер, `README-RU.md`,
 `Uninstall.exe`. Никаких `Сохранения/`, `app.log`, `config.json` там быть не должно.
 
 ### 6.4. Финальный EXE

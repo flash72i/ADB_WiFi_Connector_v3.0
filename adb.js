@@ -317,6 +317,8 @@ function portRangeScan(host, from = 32768, to = 60999, concurrency = 420, timeou
     };
     const tick = () => {
       if (finished) return;
+      // внешняя отмена: свип больше не нужен (порт уже найден другим источником)
+      if (typeof opts.shouldStop === 'function' && opts.shouldStop()) { finish(); return; }
       while (active < concurrency && next <= to) {
         const port = next++;
         active++;
